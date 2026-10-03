@@ -516,8 +516,11 @@ types:
 	t.Logf("30-hop chain correctly returned ErrDepthExceeded")
 }
 
-func TestDifferential_EngineVsOracle_10000Checks(t *testing.T) {
-	// Randomized differential testing: 10,000 checks comparing Engine vs naive Oracle.
+func TestDifferential_ExhaustiveFixpointOracle(t *testing.T) {
+	// Independent differential testing:
+	// Evaluates ALL (object, permission, user) triples for multiple randomized graphs
+	// comparing Engine against the bottom-up least-fixpoint Oracle.
+	// Includes arrows, intersection, exclusion, wildcard, nested and cyclic groups.
 	seed := time.Now().UnixNano()
 	t.Logf("Differential Test Seed: %d", seed)
 	rng := rand.New(rand.NewSource(seed))
@@ -529,154 +532,363 @@ types:
   group:
     relations:
       member: [user, "group#member"]
+  folder:
+    relations:
+      parent: [folder]
+      viewer: [user, "user:*"]
+    permissions:
+      view: "viewer + parent->view"
   doc:
     relations:
-      owner:  [user]
-      editor: [user, "group#member"]
-      viewer: [user, "group#member", "user:*"]
-      banned: [user]
+      parent:   [folder]
+      owner:    [user]
+      approver: [user]
+      editor:   ["group#member"]
+      banned:   [user]
     permissions:
-      edit: "owner + editor"
-      view: "(edit + viewer) - banned"
+      edit:    "owner + editor"
+      publish: "owner & approver"
+      view:    "(edit + parent->view) - banned"
 `
 	pool := getTestPool(t)
 	s := store.New(pool)
 	ctx := context.Background()
-
-	uid, _ := ids.NewUUIDv7()
-	tenantID := "tenant_diff_" + strings.ReplaceAll(uid.String(), "-", "")
 
 	sch, err := schema.ParseAndValidate(diffSchema)
 	if err != nil {
 		t.Fatalf("seed %d: failed to parse diff schema: %v", seed, err)
 	}
 
-	_, err = s.SaveSchema(ctx, tenantID, 1, diffSchema, sch)
-	if err != nil {
-		t.Fatalf("seed %d: failed to save schema: %v", seed, err)
-	}
+	const numGraphs = 8
+	const numDocs = 4
+	const numFolders = 3
+	const numGroups = 3
+	users := []string{"u1", "u2", "u3", "u4", "u5"}
 
-	// Generate a randomized graph of 100 tuples
-	const numDocs = 15
-	const numGroups = 8
-	const numUsers = 25
+	totalTriplesChecked := 0
 
-	var tuples []store.Tuple
-	var writeOps []store.TupleOperation
+	for g := 0; g < numGraphs; g++ {
+		uid, _ := ids.NewUUIDv7()
+		tenantID := fmt.Sprintf("tenant_diff_g%d_%s", g, strings.ReplaceAll(uid.String(), "-", ""))
 
-	// 1. Random group memberships (including potential nested groups and cycles)
-	for i := 1; i <= numGroups; i++ {
-		// Random user members
-		numMembers := rng.Intn(4) + 1
-		for m := 0; m < numMembers; m++ {
-			uID := fmt.Sprintf("u%d", rng.Intn(numUsers)+1)
-			tup := store.Tuple{
-				ObjectType:  "group",
-				ObjectID:    fmt.Sprintf("g%d", i),
-				Relation:    "member",
-				SubjectType: "user",
-				SubjectID:   uID,
-			}
-			tuples = append(tuples, tup)
-			writeOps = append(writeOps, store.TupleOperation{Op: store.OpTouch, Tuple: tup})
+		_, err = s.SaveSchema(ctx, tenantID, 1, diffSchema, sch)
+		if err != nil {
+			t.Fatalf("seed %d (graph %d): failed to save schema: %v", seed, g, err)
 		}
 
-		// Random nested group
-		if rng.Float32() < 0.4 {
-			targetGroup := fmt.Sprintf("g%d", rng.Intn(numGroups)+1)
+		var tuples []store.Tuple
+		var writeOps []store.TupleOperation
+
+		// 1. Group memberships (nested and cyclic)
+		for i := 1; i <= numGroups; i++ {
+			// user members
+			for _, u := range users {
+				if rng.Float32() < 0.3 {
+					tup := store.Tuple{
+						ObjectType:  "group",
+						ObjectID:    fmt.Sprintf("g%d", i),
+						Relation:    "member",
+						SubjectType: "user",
+						SubjectID:   u,
+					}
+					tuples = append(tuples, tup)
+					writeOps = append(writeOps, store.TupleOperation{Op: store.OpCreate, Tuple: tup})
+				}
+			}
+			// nested group (including potential cycles)
+			targetG := fmt.Sprintf("g%d", rng.Intn(numGroups)+1)
 			tup := store.Tuple{
 				ObjectType:      "group",
 				ObjectID:        fmt.Sprintf("g%d", i),
 				Relation:        "member",
 				SubjectType:     "group",
-				SubjectID:       targetGroup,
+				SubjectID:       targetG,
 				SubjectRelation: "member",
 			}
 			tuples = append(tuples, tup)
-			writeOps = append(writeOps, store.TupleOperation{Op: store.OpTouch, Tuple: tup})
+			writeOps = append(writeOps, store.TupleOperation{Op: store.OpCreate, Tuple: tup})
+		}
+
+		// 2. Folder hierarchy and viewers (including wildcard)
+		for f := 1; f <= numFolders; f++ {
+			fID := fmt.Sprintf("f%d", f)
+			// parent folder
+			if f > 1 && rng.Float32() < 0.7 {
+				parentID := fmt.Sprintf("f%d", rng.Intn(f-1)+1)
+				tup := store.Tuple{ObjectType: "folder", ObjectID: fID, Relation: "parent", SubjectType: "folder", SubjectID: parentID}
+				tuples = append(tuples, tup)
+				writeOps = append(writeOps, store.TupleOperation{Op: store.OpCreate, Tuple: tup})
+			}
+			// wildcard viewer on some folders
+			if rng.Float32() < 0.25 {
+				tup := store.Tuple{ObjectType: "folder", ObjectID: fID, Relation: "viewer", SubjectType: "user", SubjectID: "*"}
+				tuples = append(tuples, tup)
+				writeOps = append(writeOps, store.TupleOperation{Op: store.OpCreate, Tuple: tup})
+			}
+			// user viewers
+			for _, u := range users {
+				if rng.Float32() < 0.2 {
+					tup := store.Tuple{ObjectType: "folder", ObjectID: fID, Relation: "viewer", SubjectType: "user", SubjectID: u}
+					tuples = append(tuples, tup)
+					writeOps = append(writeOps, store.TupleOperation{Op: store.OpCreate, Tuple: tup})
+				}
+			}
+		}
+
+		// 3. Doc relations (parent, owner, approver, editor group, banned)
+		for d := 1; d <= numDocs; d++ {
+			docID := fmt.Sprintf("d%d", d)
+			// parent folder
+			if rng.Float32() < 0.8 {
+				fID := fmt.Sprintf("f%d", rng.Intn(numFolders)+1)
+				tup := store.Tuple{ObjectType: "doc", ObjectID: docID, Relation: "parent", SubjectType: "folder", SubjectID: fID}
+				tuples = append(tuples, tup)
+				writeOps = append(writeOps, store.TupleOperation{Op: store.OpCreate, Tuple: tup})
+			}
+			// owner
+			ownerU := users[rng.Intn(len(users))]
+			tupOwner := store.Tuple{ObjectType: "doc", ObjectID: docID, Relation: "owner", SubjectType: "user", SubjectID: ownerU}
+			tuples = append(tuples, tupOwner)
+			writeOps = append(writeOps, store.TupleOperation{Op: store.OpCreate, Tuple: tupOwner})
+
+			// approver
+			if rng.Float32() < 0.5 {
+				appU := users[rng.Intn(len(users))]
+				tupApp := store.Tuple{ObjectType: "doc", ObjectID: docID, Relation: "approver", SubjectType: "user", SubjectID: appU}
+				tuples = append(tuples, tupApp)
+				writeOps = append(writeOps, store.TupleOperation{Op: store.OpCreate, Tuple: tupApp})
+			}
+			// editor group
+			if rng.Float32() < 0.6 {
+				gID := fmt.Sprintf("g%d", rng.Intn(numGroups)+1)
+				tupEd := store.Tuple{ObjectType: "doc", ObjectID: docID, Relation: "editor", SubjectType: "group", SubjectID: gID, SubjectRelation: "member"}
+				tuples = append(tuples, tupEd)
+				writeOps = append(writeOps, store.TupleOperation{Op: store.OpCreate, Tuple: tupEd})
+			}
+			// banned user
+			if rng.Float32() < 0.3 {
+				banU := users[rng.Intn(len(users))]
+				tupBan := store.Tuple{ObjectType: "doc", ObjectID: docID, Relation: "banned", SubjectType: "user", SubjectID: banU}
+				tuples = append(tuples, tupBan)
+				writeOps = append(writeOps, store.TupleOperation{Op: store.OpCreate, Tuple: tupBan})
+			}
+		}
+
+		rev, err := s.WriteRelationships(ctx, tenantID, writeOps)
+		if err != nil {
+			t.Fatalf("seed %d (graph %d): failed to write relationships: %v", seed, g, err)
+		}
+
+		eng := engine.New(s, engine.DefaultConfig())
+		oracle := engine.NewOracle(sch, tuples, users)
+
+		// ENUMERATE ALL (object, permission, user) triples for this graph!
+		// Docs: view, edit, publish
+		for d := 1; d <= numDocs; d++ {
+			obj := store.Object{Type: "doc", ID: fmt.Sprintf("d%d", d)}
+			for _, perm := range []string{"view", "edit", "publish"} {
+				for _, u := range users {
+					subj := store.Subject{Type: "user", ID: u}
+
+					oracleAllowed, oErr := oracle.Check(obj, perm, subj)
+					if oErr != nil {
+						t.Fatalf("seed %d graph %d: oracle error on %s#%s@%s: %v", seed, g, obj, perm, subj, oErr)
+					}
+
+					engResp, eErr := eng.Check(ctx, engine.CheckRequest{
+						TenantID:   tenantID,
+						Revision:   rev,
+						Object:     obj,
+						Permission: perm,
+						Subject:    subj,
+					})
+					if eErr != nil {
+						t.Fatalf("seed %d graph %d: engine error on %s#%s@%s: %v", seed, g, obj, perm, subj, eErr)
+					}
+
+					if engResp.Allowed != oracleAllowed {
+						t.Fatalf("seed %d graph %d DIFFERENTIAL MISMATCH on %s#%s@%s: Engine=%v, Oracle=%v",
+							seed, g, obj, perm, subj, engResp.Allowed, oracleAllowed)
+					}
+					totalTriplesChecked++
+				}
+			}
+		}
+
+		// Folders: view
+		for f := 1; f <= numFolders; f++ {
+			obj := store.Object{Type: "folder", ID: fmt.Sprintf("f%d", f)}
+			for _, u := range users {
+				subj := store.Subject{Type: "user", ID: u}
+
+				oracleAllowed, _ := oracle.Check(obj, "view", subj)
+				engResp, eErr := eng.Check(ctx, engine.CheckRequest{
+					TenantID:   tenantID,
+					Revision:   rev,
+					Object:     obj,
+					Permission: "view",
+					Subject:    subj,
+				})
+				if eErr != nil {
+					t.Fatalf("seed %d graph %d: engine error on %s#view@%s: %v", seed, g, obj, subj, eErr)
+				}
+				if engResp.Allowed != oracleAllowed {
+					t.Fatalf("seed %d graph %d DIFFERENTIAL MISMATCH on %s#view@%s: Engine=%v, Oracle=%v",
+						seed, g, obj, subj, engResp.Allowed, oracleAllowed)
+				}
+				totalTriplesChecked++
+			}
+		}
+
+		// Groups: member
+		for grp := 1; grp <= numGroups; grp++ {
+			obj := store.Object{Type: "group", ID: fmt.Sprintf("g%d", grp)}
+			for _, u := range users {
+				subj := store.Subject{Type: "user", ID: u}
+
+				oracleAllowed, _ := oracle.Check(obj, "member", subj)
+				engResp, eErr := eng.Check(ctx, engine.CheckRequest{
+					TenantID:   tenantID,
+					Revision:   rev,
+					Object:     obj,
+					Permission: "member",
+					Subject:    subj,
+				})
+				if eErr != nil {
+					t.Fatalf("seed %d graph %d: engine error on %s#member@%s: %v", seed, g, obj, subj, eErr)
+				}
+				if engResp.Allowed != oracleAllowed {
+					t.Fatalf("seed %d graph %d DIFFERENTIAL MISMATCH on %s#member@%s: Engine=%v, Oracle=%v",
+						seed, g, obj, subj, engResp.Allowed, oracleAllowed)
+				}
+				totalTriplesChecked++
+			}
 		}
 	}
 
-	// 2. Random doc relations (owner, editor, viewer, wildcard, banned)
-	for d := 1; d <= numDocs; d++ {
-		docID := fmt.Sprintf("d%d", d)
+	t.Logf("Differential Test PASSED: %d exhaustive triples verified identical across %d random graphs! Seed: %d",
+		totalTriplesChecked, numGraphs, seed)
+}
 
-		// Owner
-		ownerID := fmt.Sprintf("u%d", rng.Intn(numUsers)+1)
-		tupOwner := store.Tuple{ObjectType: "doc", ObjectID: docID, Relation: "owner", SubjectType: "user", SubjectID: ownerID}
-		tuples = append(tuples, tupOwner)
-		writeOps = append(writeOps, store.TupleOperation{Op: store.OpTouch, Tuple: tupOwner})
+func TestDifferential_WriteDeleteRevisions(t *testing.T) {
+	// Tests that writes and deletes are tested against Oracle at BOTH the old and new revisions.
+	simpleSchema := `
+version: 1
+types:
+  user: {}
+  group:
+    relations:
+      member: [user]
+  doc:
+    relations:
+      owner:  [user]
+      editor: ["group#member"]
+      banned: [user]
+    permissions:
+      edit: "owner + editor"
+      view: "edit - banned"
+`
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
 
-		// Editor (userset)
-		if rng.Float32() < 0.6 {
-			gID := fmt.Sprintf("g%d", rng.Intn(numGroups)+1)
-			tupEd := store.Tuple{ObjectType: "doc", ObjectID: docID, Relation: "editor", SubjectType: "group", SubjectID: gID, SubjectRelation: "member"}
-			tuples = append(tuples, tupEd)
-			writeOps = append(writeOps, store.TupleOperation{Op: store.OpTouch, Tuple: tupEd})
-		}
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_rev_diff_" + strings.ReplaceAll(uid.String(), "-", "")
 
-		// Viewer wildcard on 20% of docs
-		if rng.Float32() < 0.2 {
-			tupWc := store.Tuple{ObjectType: "doc", ObjectID: docID, Relation: "viewer", SubjectType: "user", SubjectID: "*"}
-			tuples = append(tuples, tupWc)
-			writeOps = append(writeOps, store.TupleOperation{Op: store.OpTouch, Tuple: tupWc})
-		}
-
-		// Banned user
-		if rng.Float32() < 0.3 {
-			bannedID := fmt.Sprintf("u%d", rng.Intn(numUsers)+1)
-			tupBan := store.Tuple{ObjectType: "doc", ObjectID: docID, Relation: "banned", SubjectType: "user", SubjectID: bannedID}
-			tuples = append(tuples, tupBan)
-			writeOps = append(writeOps, store.TupleOperation{Op: store.OpTouch, Tuple: tupBan})
-		}
-	}
-
-	rev, err := s.WriteRelationships(ctx, tenantID, writeOps)
+	sch, err := schema.ParseAndValidate(simpleSchema)
 	if err != nil {
-		t.Fatalf("seed %d: failed to write relationships: %v", seed, err)
+		t.Fatalf("failed to parse schema: %v", err)
+	}
+	_, err = s.SaveSchema(ctx, tenantID, 1, simpleSchema, sch)
+	if err != nil {
+		t.Fatalf("failed to save schema: %v", err)
+	}
+
+	// 1. Revision 1 writes
+	tup1 := store.Tuple{ObjectType: "doc", ObjectID: "d1", Relation: "owner", SubjectType: "user", SubjectID: "alice"}
+	tup2 := store.Tuple{ObjectType: "doc", ObjectID: "d1", Relation: "editor", SubjectType: "group", SubjectID: "g1", SubjectRelation: "member"}
+	tup3 := store.Tuple{ObjectType: "group", ObjectID: "g1", Relation: "member", SubjectType: "user", SubjectID: "bob"}
+	tup4 := store.Tuple{ObjectType: "doc", ObjectID: "d1", Relation: "banned", SubjectType: "user", SubjectID: "charlie"}
+
+	rev1Tuples := []store.Tuple{tup1, tup2, tup3, tup4}
+	rev1, err := s.WriteRelationships(ctx, tenantID, []store.TupleOperation{
+		{Op: store.OpCreate, Tuple: tup1},
+		{Op: store.OpCreate, Tuple: tup2},
+		{Op: store.OpCreate, Tuple: tup3},
+		{Op: store.OpCreate, Tuple: tup4},
+	})
+	if err != nil {
+		t.Fatalf("failed to write rev1 tuples: %v", err)
+	}
+
+	// 2. Revision 2 writes: delete alice as owner, delete bob from group, add charlie as owner, add alice to group
+	tup5 := store.Tuple{ObjectType: "doc", ObjectID: "d1", Relation: "owner", SubjectType: "user", SubjectID: "charlie"}
+	tup6 := store.Tuple{ObjectType: "group", ObjectID: "g1", Relation: "member", SubjectType: "user", SubjectID: "alice"}
+
+	rev2Tuples := []store.Tuple{tup2, tup4, tup5, tup6}
+	rev2, err := s.WriteRelationships(ctx, tenantID, []store.TupleOperation{
+		{Op: store.OpDelete, Tuple: tup1}, // delete alice as owner
+		{Op: store.OpDelete, Tuple: tup3}, // delete bob from group
+		{Op: store.OpCreate, Tuple: tup5}, // make charlie owner
+		{Op: store.OpCreate, Tuple: tup6}, // add alice to group
+	})
+	if err != nil {
+		t.Fatalf("failed to write rev2 tuples: %v", err)
 	}
 
 	eng := engine.New(s, engine.DefaultConfig())
-	oracle := engine.NewOracle(sch, tuples, engine.DefaultMaxDepth)
+	allUsers := []string{"alice", "bob", "charlie", "dave"}
 
-	// Run 10,000 random checks!
-	const totalChecks = 10000
-	perms := []string{"view", "edit"}
+	oracleRev1 := engine.NewOracle(sch, rev1Tuples, allUsers)
+	oracleRev2 := engine.NewOracle(sch, rev2Tuples, allUsers)
 
-	for i := 0; i < totalChecks; i++ {
-		docID := fmt.Sprintf("d%d", rng.Intn(numDocs)+1)
-		perm := perms[rng.Intn(len(perms))]
-		userID := fmt.Sprintf("u%d", rng.Intn(numUsers)+1)
+	// Compare Engine vs Oracle at Revision 1
+	for _, perm := range []string{"view", "edit"} {
+		for _, u := range allUsers {
+			obj := store.Object{Type: "doc", ID: "d1"}
+			subj := store.Subject{Type: "user", ID: u}
 
-		obj := store.Object{Type: "doc", ID: docID}
-		subj := store.Subject{Type: "user", ID: userID}
-
-		// 1. Evaluate with Oracle
-		oracleAllowed, oracleErr := oracle.Check(obj, perm, subj)
-		if oracleErr != nil {
-			t.Fatalf("seed %d: oracle error on check %d: %v", seed, i, oracleErr)
-		}
-
-		// 2. Evaluate with Engine
-		engResp, engErr := eng.Check(ctx, engine.CheckRequest{
-			TenantID:   tenantID,
-			Revision:   rev,
-			Object:     obj,
-			Permission: perm,
-			Subject:    subj,
-		})
-		if engErr != nil {
-			t.Fatalf("seed %d: engine error on check %d: %v", seed, i, engErr)
-		}
-
-		// 3. Assert equality
-		if engResp.Allowed != oracleAllowed {
-			t.Fatalf("seed %d: DIFFERENTIAL FAILURE on check %d: obj=%s, perm=%s, subj=%s: Engine=%v, Oracle=%v",
-				seed, i, obj.String(), perm, subj.String(), engResp.Allowed, oracleAllowed)
+			oAllowed, _ := oracleRev1.Check(obj, perm, subj)
+			resp, eErr := eng.Check(ctx, engine.CheckRequest{
+				TenantID:   tenantID,
+				Revision:   rev1,
+				Object:     obj,
+				Permission: perm,
+				Subject:    subj,
+			})
+			if eErr != nil {
+				t.Fatalf("Rev 1 Check error on %s#%s@%s: %v", obj, perm, subj, eErr)
+			}
+			if resp.Allowed != oAllowed {
+				t.Fatalf("Rev 1 MISMATCH on %s#%s@%s: Engine=%v, Oracle=%v", obj, perm, subj, resp.Allowed, oAllowed)
+			}
 		}
 	}
 
-	t.Logf("Differential Test PASSED: %d checks verified identical across Engine and Oracle! Seed: %d", totalChecks, seed)
+	// Compare Engine vs Oracle at Revision 2
+	for _, perm := range []string{"view", "edit"} {
+		for _, u := range allUsers {
+			obj := store.Object{Type: "doc", ID: "d1"}
+			subj := store.Subject{Type: "user", ID: u}
+
+			oAllowed, _ := oracleRev2.Check(obj, perm, subj)
+			resp, eErr := eng.Check(ctx, engine.CheckRequest{
+				TenantID:   tenantID,
+				Revision:   rev2,
+				Object:     obj,
+				Permission: perm,
+				Subject:    subj,
+			})
+			if eErr != nil {
+				t.Fatalf("Rev 2 Check error on %s#%s@%s: %v", obj, perm, subj, eErr)
+			}
+			if resp.Allowed != oAllowed {
+				t.Fatalf("Rev 2 MISMATCH on %s#%s@%s: Engine=%v, Oracle=%v", obj, perm, subj, resp.Allowed, oAllowed)
+			}
+		}
+	}
+
+	t.Logf("Differential Test PASSED at both old Revision %d and new Revision %d!", rev1, rev2)
 }
 
 func TestCheck_DenseCyclicGroups(t *testing.T) {
