@@ -196,11 +196,16 @@ func (s *Store) GetSchemaByVersion(ctx context.Context, tenantID string, version
 
 // WriteRelationships executes a batch of relationship writes atomically in ONE transaction.
 func (s *Store) WriteRelationships(ctx context.Context, tenantID string, ops []TupleOperation) (int64, error) {
+	return s.WriteRelationshipsWithPreconditions(ctx, tenantID, ops, nil)
+}
+
+// WriteRelationshipsWithPreconditions executes a batch of relationship writes atomically in ONE transaction after verifying preconditions.
+func (s *Store) WriteRelationshipsWithPreconditions(ctx context.Context, tenantID string, ops []TupleOperation, preconditions []Precondition) (int64, error) {
 	if !ValidateID(tenantID, false) {
 		return 0, fmt.Errorf("%w: invalid tenant id %q", ErrInvalidIdentifier, tenantID)
 	}
 
-	if len(ops) == 0 {
+	if len(ops) == 0 && len(preconditions) == 0 {
 		return s.GetTenantRevision(ctx, tenantID)
 	}
 
@@ -212,6 +217,13 @@ func (s *Store) WriteRelationships(ctx context.Context, tenantID string, ops []T
 		}
 		if op.Op != OpTouch && op.Op != OpCreate && op.Op != OpDelete {
 			return 0, fmt.Errorf("batch operation %d: invalid op %q (must be touch, create, or delete)", i, op.Op)
+		}
+	}
+
+	for i, p := range preconditions {
+		p.Tuple.TenantID = tenantID
+		if err := p.Tuple.Validate(); err != nil {
+			return 0, fmt.Errorf("precondition %d: %w", i, err)
 		}
 	}
 
@@ -257,7 +269,32 @@ func (s *Store) WriteRelationships(ctx context.Context, tenantID string, ops []T
 		return 0, fmt.Errorf("failed to deserialize schema: %w", err)
 	}
 
-	// 3. Validate every tuple against the schema
+	// 3. Verify preconditions
+	for i, p := range preconditions {
+		var dummy int
+		checkErr := tx.QueryRow(ctx, `
+			SELECT 1 FROM authz_tuples
+			WHERE tenant_id = $1
+			  AND object_type = $2
+			  AND object_id = $3
+			  AND relation = $4
+			  AND subject_type = $5
+			  AND subject_id = $6
+			  AND subject_relation = $7
+			  AND deleted_rev IS NULL
+			LIMIT 1
+		`, tenantID, p.Tuple.ObjectType, p.Tuple.ObjectID, p.Tuple.Relation, p.Tuple.SubjectType, p.Tuple.SubjectID, p.Tuple.SubjectRelation).Scan(&dummy)
+
+		exists := checkErr == nil
+		if p.Exists && !exists {
+			return 0, fmt.Errorf("%w: precondition %d failed: tuple %s does not exist", ErrPreconditionFailed, i, p.Tuple.String())
+		}
+		if !p.Exists && exists {
+			return 0, fmt.Errorf("%w: precondition %d failed: tuple %s already exists", ErrPreconditionFailed, i, p.Tuple.String())
+		}
+	}
+
+	// 4. Validate every tuple against the schema
 	for i, op := range ops {
 		if err := ValidateTupleAgainstSchema(&sch, &op.Tuple); err != nil {
 			return 0, fmt.Errorf("batch operation %d: %w", i, err)
@@ -565,7 +602,6 @@ func (s *Store) ReadUsersetTuples(ctx context.Context, tenantID string, obj Obje
 		  AND subject_relation != ''
 		  AND created_rev <= $5
 		  AND (deleted_rev IS NULL OR deleted_rev > $5)
-		ORDER BY subject_type, subject_id, subject_relation
 	`
 
 	rows, err := s.pool.Query(ctx, query, tenantID, obj.Type, obj.ID, relation, revision)

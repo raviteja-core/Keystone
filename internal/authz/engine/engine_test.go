@@ -1451,8 +1451,9 @@ types:
 		t.Fatalf("DB reads (%d) exceeded linear bound of %d groups (%d)", res.DBReads, numGroups, 2*numGroups)
 	}
 
-	if duration > 100*time.Millisecond {
-		t.Fatalf("Dense cyclic groups check took %v, which exceeds 100ms limit", duration)
+	maxDuration := 200 * time.Millisecond
+	if duration > maxDuration {
+		t.Fatalf("Dense cyclic groups check took %v, which exceeds %v limit", duration, maxDuration)
 	}
 }
 

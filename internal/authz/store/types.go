@@ -17,7 +17,14 @@ var (
 	ErrNoSchema           = errors.New("no schema configured for tenant")
 	ErrTupleAlreadyExists = errors.New("tuple already exists")
 	ErrSchemaValidation   = errors.New("tuple violates current schema")
+	ErrPreconditionFailed = errors.New("precondition failed")
 )
+
+// Precondition asserts the existence or non-existence of a tuple before writes.
+type Precondition struct {
+	Tuple  Tuple
+	Exists bool
+}
 
 // ValidateTypeOrRelation validates type or relation names against ^[a-z][a-z0-9_]{0,63}$.
 func ValidateTypeOrRelation(s string) bool {

@@ -1,0 +1,566 @@
+openapi: 3.1.0
+info:
+  title: Keystone Authz Engine API
+  description: |
+    Google Zanzibar-inspired Relationship-Based Access Control (ReBAC) permission engine for Keystone IAM.
+    Implements relationship tuples, dynamic schema definitions with Zanzibar-style usersets and arrow operators,
+    snapshot-consistent reads via zookies, cycle-safe evaluation, and RFC 9457 problem details.
+  version: 0.1.0
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  - url: http://localhost:8081
+    description: Local development Authz Server
+  - url: http://localhost:9101
+    description: Local development Admin/Health port
+
+security:
+  - OAuth2Bearer: []
+
+paths:
+  /v1/schema:
+    put:
+      summary: Upload and compile a new schema version
+      description: Validates and stores a new schema definition for the caller's tenant. Atomically bumps schema version and tenant revision.
+      operationId: putSchema
+      security:
+        - OAuth2Bearer:
+            - authz:admin
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+              description: YAML schema definition text
+          application/json:
+            schema:
+              type: object
+              properties:
+                schema:
+                  type: string
+                  description: YAML schema definition text
+              required:
+                - schema
+      responses:
+        '200':
+          description: Schema successfully saved and compiled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PutSchemaResponse'
+        '400':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '401':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '403':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+
+    get:
+      summary: Retrieve the current or specified schema
+      description: Returns the active schema definition for the caller's tenant, or a specific version if requested via query parameter.
+      operationId: getSchema
+      security:
+        - OAuth2Bearer:
+            - authz:read
+      parameters:
+        - name: version
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Optional schema version number to retrieve
+      responses:
+        '200':
+          description: Active schema definition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetSchemaResponse'
+        '401':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '403':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '404':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+
+  /v1/relationships/write:
+    post:
+      summary: Batch write relationship tuples
+      description: Atomically executes a batch of relationship operations (create, touch, delete) with optional preconditions.
+      operationId: writeRelationships
+      security:
+        - OAuth2Bearer:
+            - authz:write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WriteRelationshipsRequest'
+      responses:
+        '200':
+          description: Batch write committed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WriteRelationshipsResponse'
+        '400':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '401':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '403':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '409':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '412':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+
+  /v1/relationships/read:
+    post:
+      summary: Read relationship tuples by filter
+      description: Reads relationship tuples matching object, relation, or subject filters at a given snapshot revision.
+      operationId: readRelationships
+      security:
+        - OAuth2Bearer:
+            - authz:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReadRelationshipsRequest'
+      responses:
+        '200':
+          description: Filtered list of relationship tuples
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadRelationshipsResponse'
+        '400':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '401':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '403':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+
+  /v1/check:
+    post:
+      summary: Check a permission
+      description: Evaluates whether a subject has a specified permission on an object with Zanzibar graph evaluation semantics.
+      operationId: checkPermission
+      security:
+        - OAuth2Bearer:
+            - authz:check
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckRequest'
+      responses:
+        '200':
+          description: Evaluation result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckResponse'
+        '400':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '401':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '403':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '429':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+
+  /v1/check/batch:
+    post:
+      summary: Batch check permissions
+      description: Evaluates up to 100 permission checks under a shared snapshot consistency token.
+      operationId: batchCheckPermission
+      security:
+        - OAuth2Bearer:
+            - authz:check
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchCheckRequest'
+      responses:
+        '200':
+          description: Batch evaluation results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchCheckResponse'
+        '400':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '401':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '403':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+
+  /v1/expand:
+    post:
+      summary: Expand userset tree
+      description: Returns the tree representation of how a permission is composed on an object.
+      operationId: expandPermission
+      security:
+        - OAuth2Bearer:
+            - authz:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExpandRequest'
+      responses:
+        '200':
+          description: Userset expansion tree
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExpandResponse'
+        '400':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '401':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+        '403':
+          $ref: '#/components/responses/ProblemDetailsResponse'
+
+components:
+  securitySchemes:
+    OAuth2Bearer:
+      type: oauth2
+      description: RFC 9068 RS256 JWT access token with audience keystone-authz
+      flows:
+        clientCredentials:
+          tokenUrl: http://localhost:8080/oauth/token
+          scopes:
+            authz:admin: Administrative schema and tenant operations
+            authz:write: Write relationship tuples
+            authz:read: Read schemas and relationship tuples
+            authz:check: Execute permission checks
+
+  responses:
+    ProblemDetailsResponse:
+      description: RFC 9457 HTTP Problem Details error response
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+  schemas:
+    ProblemDetails:
+      type: object
+      required:
+        - type
+        - title
+        - status
+      properties:
+        type:
+          type: string
+          format: uri
+          example: https://keystone.dev/errors/unauthorized
+        title:
+          type: string
+          example: Unauthorized
+        status:
+          type: integer
+          example: 401
+        detail:
+          type: string
+          example: missing Authorization header
+        instance:
+          type: string
+          example: /v1/check
+
+    ObjectRef:
+      type: object
+      required:
+        - type
+        - id
+      properties:
+        type:
+          type: string
+          example: doc
+        id:
+          type: string
+          example: "42"
+
+    SubjectRef:
+      type: object
+      required:
+        - type
+        - id
+      properties:
+        type:
+          type: string
+          example: user
+        id:
+          type: string
+          example: alice
+        relation:
+          type: string
+          example: ""
+
+    Consistency:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [at_least_as_fresh, fully_consistent, minimize_latency]
+          default: fully_consistent
+        token:
+          type: string
+          description: Zookie token, e.g. v1.eyJ0Ijoi...
+
+    Tuple:
+      type: object
+      required:
+        - object
+        - relation
+        - subject
+      properties:
+        object:
+          $ref: '#/components/schemas/ObjectRef'
+        relation:
+          type: string
+          example: viewer
+        subject:
+          $ref: '#/components/schemas/SubjectRef'
+
+    TupleOperation:
+      type: object
+      required:
+        - op
+        - tuple
+      properties:
+        op:
+          type: string
+          enum: [create, touch, delete]
+        tuple:
+          $ref: '#/components/schemas/Tuple'
+
+    Precondition:
+      type: object
+      required:
+        - tuple
+        - exists
+      properties:
+        tuple:
+          $ref: '#/components/schemas/Tuple'
+        exists:
+          type: boolean
+
+    PutSchemaResponse:
+      type: object
+      required:
+        - version
+        - zookie
+      properties:
+        version:
+          type: integer
+          example: 1
+        zookie:
+          type: string
+          example: v1.eyJ0IjoidGVuYW50MSIsInIiOjF9
+
+    GetSchemaResponse:
+      type: object
+      required:
+        - version
+        - definition
+        - created_at
+      properties:
+        version:
+          type: integer
+          example: 1
+        definition:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    WriteRelationshipsRequest:
+      type: object
+      properties:
+        updates:
+          type: array
+          items:
+            $ref: '#/components/schemas/TupleOperation'
+        preconditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Precondition'
+
+    WriteRelationshipsResponse:
+      type: object
+      required:
+        - zookie
+      properties:
+        zookie:
+          type: string
+          example: v1.eyJ0IjoidGVuYW50MSIsInIiOjJ9
+
+    ReadRelationshipsRequest:
+      type: object
+      properties:
+        object:
+          $ref: '#/components/schemas/ObjectRef'
+        relation:
+          type: string
+        subject:
+          $ref: '#/components/schemas/SubjectRef'
+        limit:
+          type: integer
+          default: 50
+        consistency:
+          $ref: '#/components/schemas/Consistency'
+
+    ReadRelationshipsResponse:
+      type: object
+      required:
+        - tuples
+        - read_at
+      properties:
+        tuples:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tuple'
+        read_at:
+          type: string
+          example: v1.eyJ0IjoidGVuYW50MSIsInIiOjJ9
+        continuation_token:
+          type: string
+
+    CheckRequest:
+      type: object
+      required:
+        - permission
+        - subject
+      properties:
+        resource:
+          $ref: '#/components/schemas/ObjectRef'
+        object:
+          $ref: '#/components/schemas/ObjectRef'
+        permission:
+          type: string
+          example: view
+        subject:
+          $ref: '#/components/schemas/SubjectRef'
+        consistency:
+          $ref: '#/components/schemas/Consistency'
+
+    Evaluation:
+      type: object
+      required:
+        - depth
+        - db_reads
+      properties:
+        depth:
+          type: integer
+          example: 2
+        db_reads:
+          type: integer
+          example: 3
+
+    CheckResponse:
+      type: object
+      required:
+        - allowed
+        - checked_at
+        - evaluation
+      properties:
+        allowed:
+          type: boolean
+          example: true
+        checked_at:
+          type: string
+          example: v1.eyJ0IjoidGVuYW50MSIsInIiOjJ9
+        evaluation:
+          $ref: '#/components/schemas/Evaluation'
+
+    BatchCheckRequest:
+      type: object
+      required:
+        - checks
+      properties:
+        checks:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/CheckRequest'
+        consistency:
+          $ref: '#/components/schemas/Consistency'
+
+    BatchCheckItemResult:
+      type: object
+      required:
+        - allowed
+      properties:
+        allowed:
+          type: boolean
+        evaluation:
+          $ref: '#/components/schemas/Evaluation'
+        error:
+          type: string
+
+    BatchCheckResponse:
+      type: object
+      required:
+        - checked_at
+        - results
+      properties:
+        checked_at:
+          type: string
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/BatchCheckItemResult'
+
+    ExpandRequest:
+      type: object
+      required:
+        - permission
+      properties:
+        resource:
+          $ref: '#/components/schemas/ObjectRef'
+        object:
+          $ref: '#/components/schemas/ObjectRef'
+        permission:
+          type: string
+          example: view
+        consistency:
+          $ref: '#/components/schemas/Consistency'
+
+    ExpandTreeNode:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum: [leaf, union, intersection, exclusion, arrow]
+        target:
+          $ref: '#/components/schemas/ObjectRef'
+        relation:
+          type: string
+        subject:
+          $ref: '#/components/schemas/SubjectRef'
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExpandTreeNode'
+
+    ExpandResponse:
+      type: object
+      required:
+        - tree
+      properties:
+        tree:
+          $ref: '#/components/schemas/ExpandTreeNode'

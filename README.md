@@ -209,6 +209,111 @@ Output:
 }
 ```
 
+#### G. ReBAC Permissions with Authz Engine (Phase 2)
+
+##### 1. Push ReBAC Authorization Schema
+Use `keystonectl` to push the authorization schema defining object types, relations, and permissions:
+
+```bash
+# Push schema file for tenant "default" (requires authz:admin token or direct keystonectl push)
+cat << 'EOF' > schema.yaml
+schema:
+  document:
+    relations:
+      owner: [user]
+      editor: [user, "group#member"]
+      viewer: [user, "*"]
+    permissions:
+      view: viewer + edit
+      edit: editor + owner
+      delete: owner
+EOF
+
+go run ./cmd/keystonectl schema push \
+  --file=schema.yaml \
+  --tenant=default \
+  --authz-url=http://localhost:8081 \
+  --token="$ACCESS_TOKEN"
+rm -f schema.yaml
+```
+
+##### 2. Write Relationship Tuples
+Grant `alice` the `owner` relation on `document:doc1`:
+
+```bash
+curl -s -X POST http://localhost:8081/v1/relationships/write \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "updates": [
+      {
+        "operation": "insert",
+        "tuple": {
+          "object_type": "document",
+          "object_id": "doc1",
+          "relation": "owner",
+          "subject_type": "user",
+          "subject_id": "alice"
+        }
+      }
+    ]
+  }'
+```
+
+Response returns the monotonic revision Zookie:
+```json
+{
+  "zookie": "zk:default:018f...:1"
+}
+```
+
+##### 3. Check Permissions with Snapshot Consistency
+Check if `alice` can `view` `document:doc1`:
+
+```bash
+curl -s -X POST http://localhost:8081/v1/check \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "object_type": "document",
+    "object_id": "doc1",
+    "permission": "view",
+    "subject_type": "user",
+    "subject_id": "alice"
+  }'
+```
+
+Output:
+```json
+{
+  "allowed": true,
+  "resolved_revision": 1
+}
+```
+
+Check if `bob` (who has no tuple) can `delete` `document:doc1`:
+
+```bash
+curl -s -X POST http://localhost:8081/v1/check \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "object_type": "document",
+    "object_id": "doc1",
+    "permission": "delete",
+    "subject_type": "user",
+    "subject_id": "bob"
+  }'
+```
+
+Output:
+```json
+{
+  "allowed": false,
+  "resolved_revision": 1
+}
+```
+
 ---
 
 ## 4. Standards Conformance Baseline
@@ -221,7 +326,8 @@ Output:
 | **RFC 9068** | JWT Profile for OAuth 2.0 Access Tokens (`typ: at+jwt`, RS256) | Conforms |
 | **RFC 9106 / OWASP** | Argon2id password hashing ($m=65536, t=3, p=4$) | Exceeds minimums |
 | **RFC 7517 / RFC 8414** | JWKS (`/jwks.json`) and OIDC Discovery (`/.well-known/openid-configuration`) | Conforms |
-| **Google Zanzibar** | Relationship tuples, userset rewrites, monotonic zookie consistency | In Progress (P2) |
+| **RFC 9457** | Problem Details for HTTP APIs (`application/problem+json`) on Authz engine | Conforms |
+| **Google Zanzibar** | Relationship tuples, userset rewrites, transitive graph checks, cycle prevention, monotonic zookies | Conforms (Phase 2) |
 
 ---
 

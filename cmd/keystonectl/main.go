@@ -12,6 +12,8 @@ import (
 	"github.com/raviteja-core/keystone/internal/auth/audit"
 	"github.com/raviteja-core/keystone/internal/auth/password"
 	"github.com/raviteja-core/keystone/internal/auth/store"
+	"github.com/raviteja-core/keystone/internal/authz/schema"
+	authzstore "github.com/raviteja-core/keystone/internal/authz/store"
 	"github.com/raviteja-core/keystone/internal/platform/db"
 	"github.com/raviteja-core/keystone/internal/platform/ids"
 )
@@ -94,13 +96,18 @@ func main() {
 		fmt.Printf("keystonectl: audit %s ready for Phase 4\n", os.Args[2])
 
 	case "schema":
-		schemaCmd := flag.NewFlagSet("schema", flag.ExitOnError)
 		if len(os.Args) < 3 {
-			fmt.Println("usage: keystonectl schema <push>")
+			fmt.Println("usage: keystonectl schema <push> [flags]")
 			os.Exit(1)
 		}
-		_ = schemaCmd.Parse(os.Args[3:])
-		fmt.Printf("keystonectl: schema %s ready for Phase 2\n", os.Args[2])
+		subCmd := os.Args[2]
+		switch subCmd {
+		case "push":
+			runSchemaPush(os.Args[3:])
+		default:
+			fmt.Fprintf(os.Stderr, "unknown schema command: %s\n", subCmd)
+			os.Exit(1)
+		}
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", command)
@@ -333,6 +340,91 @@ func runClientCreate(args []string) {
 		fmt.Println("Save this secret immediately! It is hashed and will NOT be shown again.")
 		fmt.Println("--------------------------------------------------------------------------------")
 	}
+}
+
+func getAuthzDBPool(ctx context.Context, explicitURL string) (*pgxpool.Pool, error) {
+	dbURL := explicitURL
+	if dbURL == "" {
+		dbURL = os.Getenv("KEYSTONE_AUTHZ_DB_URL")
+	}
+	if dbURL == "" {
+		port := os.Getenv("KEYSTONE_POSTGRES_PORT")
+		if port == "" {
+			port = "54320"
+		}
+		dbURL = "postgres://keystone_authz_app:authz_dev_password@localhost:" + port + "/keystone_authz?sslmode=disable"
+	}
+
+	return db.NewPool(ctx, db.DefaultConfig(dbURL))
+}
+
+func runSchemaPush(args []string) {
+	fs := flag.NewFlagSet("schema push", flag.ExitOnError)
+	file := fs.String("file", "", "Path to schema YAML file (required)")
+	tenantID := fs.String("tenant", "", "Tenant ID (required)")
+	dbURL := fs.String("db-url", "", "PostgreSQL authz database connection URL")
+	_ = fs.Parse(args)
+
+	if *file == "" || *tenantID == "" {
+		fmt.Fprintln(os.Stderr, "Error: --file and --tenant are required")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	content, err := os.ReadFile(*file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to read schema file: %v\n", err)
+		os.Exit(1)
+	}
+
+	sch, err := schema.ParseAndValidate(string(content))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: schema validation failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pool, err := getAuthzDBPool(ctx, *dbURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to connect to authz database: %v\n", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	// Ensure tenant exists
+	_, err = pool.Exec(ctx, `
+		INSERT INTO authz_tenants (tenant_id, current_rev)
+		VALUES ($1, 0)
+		ON CONFLICT (tenant_id) DO NOTHING
+	`, *tenantID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to initialize tenant: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Get next version
+	var nextVersion int
+	err = pool.QueryRow(ctx, `
+		SELECT COALESCE(MAX(version), 0) + 1
+		FROM authz_schemas
+		WHERE tenant_id = $1
+	`, *tenantID).Scan(&nextVersion)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to determine schema version: %v\n", err)
+		os.Exit(1)
+	}
+
+	s := authzstore.New(pool)
+	createdRev, err := s.SaveSchema(ctx, *tenantID, nextVersion, string(content), sch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to save schema: %v\n", err)
+		os.Exit(1)
+	}
+
+	zookie := authzstore.EncodeZookie(*tenantID, createdRev)
+	fmt.Printf("Schema version %d successfully pushed for tenant %q (zookie: %s)\n", nextVersion, *tenantID, zookie)
 }
 
 func printUsage() {

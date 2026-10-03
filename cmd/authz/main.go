@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/raviteja-core/keystone/internal/authz/api"
+	"github.com/raviteja-core/keystone/internal/authz/engine"
+	"github.com/raviteja-core/keystone/internal/authz/store"
 	"github.com/raviteja-core/keystone/internal/platform/config"
 	"github.com/raviteja-core/keystone/internal/platform/db"
 	"github.com/raviteja-core/keystone/internal/platform/httpx"
@@ -62,23 +65,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Public HTTP router
-	publicMux := http.NewServeMux()
-	publicMux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"service": "keystone-authz",
-			"version": "0.1.0",
-		})
-	})
+	// Initialize store and engine
+	authzStore := store.New(pool)
+	authzEngine := engine.New(authzStore, engine.DefaultConfig())
+
+	// Initialize JWKS key provider from Auth Server discovery or config
+	jwksURL := os.Getenv("KEYSTONE_AUTH_JWKS_URL")
+	if jwksURL == "" {
+		authAddr := os.Getenv("KEYSTONE_AUTH_URL")
+		if authAddr == "" {
+			authAddr = "http://localhost:8080"
+		}
+		jwksURL = authAddr + "/jwks.json"
+	}
+	expectedIssuer := os.Getenv("KEYSTONE_AUTH_ISSUER")
+	keyProvider := api.NewRemoteJWKSProvider(jwksURL, &http.Client{Timeout: 5 * time.Second})
+	authenticator := api.NewAuthenticator(expectedIssuer, "keystone-authz", keyProvider)
+
+	// Public HTTP router with ReBAC Zanzibar endpoints
+	publicMux := api.NewServerMux(pool, authzStore, authzEngine, authenticator, api.DefaultServerConfig())
 
 	// Wrap public handler in middleware stack
 	publicHandler := httpx.RequestID(
 		httpx.Recover(logger)(
 			httpx.AccessLog(logger)(
-				httpx.SecurityHeaders(
-					httpx.MaxBodyBytes(65536)(publicMux),
-				),
+				publicMux,
 			),
 		),
 	)
