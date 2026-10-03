@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Keystone Login</title>
+</head>
+<body>
+<main>
+<h1>Sign In to Keystone</h1>
+{{if .Error}}<p role="alert" style="color:red">{{.Error}}</p>{{end}}
+<form method="POST" action="/login">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+  <input type="hidden" name="return_to" value="{{.ReturnTo}}">
+  <div>
+    <label for="email">Email address</label>
+    <input id="email" type="email" name="email" required autofocus>
+  </div>
+  <div>
+    <label for="password">Password</label>
+    <input id="password" type="password" name="password" required>
+  </div>
+  <button id="login-submit" type="submit">Sign In</button>
+</form>
+<p>Need an account? <a href="/register?return_to={{.ReturnTo}}">Register</a></p>
+</main>
+</body>
+</html>

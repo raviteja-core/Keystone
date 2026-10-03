@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Keystone Register</title>
+</head>
+<body>
+<main>
+<h1>Create Keystone Account</h1>
+{{if .Error}}<p role="alert" style="color:red">{{.Error}}</p>{{end}}
+<form method="POST" action="/register">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+  <input type="hidden" name="return_to" value="{{.ReturnTo}}">
+  <div>
+    <label for="email">Email address</label>
+    <input id="email" type="email" name="email" required autofocus value="{{.Email}}">
+  </div>
+  <div>
+    <label for="username">Username (optional)</label>
+    <input id="username" type="text" name="username" value="{{.Username}}">
+  </div>
+  <div>
+    <label for="password">Password (minimum 12 characters)</label>
+    <input id="password" type="password" name="password" required minlength="12" maxlength="128">
+  </div>
+  <button id="register-submit" type="submit">Create Account</button>
+</form>
+<p>Already have an account? <a href="/login?return_to={{.ReturnTo}}">Sign In</a></p>
+</main>
+</body>
+</html>

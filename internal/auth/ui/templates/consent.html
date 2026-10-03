@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Authorize Application</title>
+</head>
+<body>
+<main>
+<h1>Authorize {{.ClientName}}</h1>
+<p>The application <strong>{{.ClientName}}</strong> is requesting access to your account with the following permissions:</p>
+{{if .Error}}<p role="alert" style="color:red">{{.Error}}</p>{{end}}
+<form method="POST" action="/consent">
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+  <input type="hidden" name="client_id" value="{{.ClientID}}">
+  <input type="hidden" name="scope" value="{{.Scope}}">
+  <input type="hidden" name="return_to" value="{{.ReturnTo}}">
+  <ul>
+  {{range .Scopes}}
+    <li><strong>{{.Name}}</strong> — {{.Description}}</li>
+  {{end}}
+  </ul>
+  <div>
+    <button id="consent-accept" type="submit" name="action" value="accept">Allow Access</button>
+    <button id="consent-deny" type="submit" name="action" value="deny">Deny</button>
+  </div>
+</form>
+</main>
+</body>
+</html>

@@ -1,0 +1,66 @@
+name: keystone
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: keystone-postgres
+    restart: unless-stopped
+    ports:
+      - "${KEYSTONE_POSTGRES_PORT:-54320}:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_supersecret
+    volumes:
+      - ./deploy/docker/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+      - keystone-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  authserver:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.authserver
+    container_name: keystone-authserver
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "9100:9100"
+    environment:
+      KEYSTONE_ENV: ${KEYSTONE_ENV:-dev}
+      KEYSTONE_ISSUER: ${KEYSTONE_ISSUER:-http://localhost:8080}
+      KEYSTONE_HTTP_ADDR: ":8080"
+      KEYSTONE_ADMIN_ADDR: ":9100"
+      KEYSTONE_DB_URL: ${KEYSTONE_AUTH_DB_URL:-postgres://keystone_auth_app:auth_dev_password@postgres:5432/keystone_auth?sslmode=disable}
+      KEYSTONE_MASTER_KEY: ${KEYSTONE_MASTER_KEY:-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=}
+      KEYSTONE_COOKIE_SECURE: ${KEYSTONE_COOKIE_SECURE:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  authz:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.authz
+    container_name: keystone-authz
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+      - "9101:9101"
+    environment:
+      KEYSTONE_ENV: ${KEYSTONE_ENV:-dev}
+      KEYSTONE_ISSUER: ${KEYSTONE_ISSUER:-http://localhost:8080}
+      KEYSTONE_HTTP_ADDR: ":8081"
+      KEYSTONE_ADMIN_ADDR: ":9101"
+      KEYSTONE_DB_URL: ${KEYSTONE_AUTHZ_DB_URL:-postgres://keystone_authz_app:authz_dev_password@postgres:5432/keystone_authz?sslmode=disable}
+      KEYSTONE_MASTER_KEY: ${KEYSTONE_MASTER_KEY:-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=}
+      KEYSTONE_COOKIE_SECURE: ${KEYSTONE_COOKIE_SECURE:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  keystone-postgres-data:

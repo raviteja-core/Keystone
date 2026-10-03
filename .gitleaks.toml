@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Global allowlist for example and test files"
+paths = [
+  '''^\.env\.example$''',
+  '''^docs/.*''',
+  '''^.*_test\.go$''',
+  '''^test/.*''',
+]

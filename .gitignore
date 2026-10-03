@@ -1,0 +1,46 @@
+# Binaries and build artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+*.coverprofile
+
+# Go workspace
+vendor/
+
+# Java and Maven
+target/
+*.class
+*.jar
+*.war
+*.ear
+.mvn/.extracted/
+
+# Environment files and secrets
+.env
+*.pem
+*.key
+*.p12
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+/tmp/
+scratch/
+.env
+*.out
+.claude/
+.agents/
+.keystone/
