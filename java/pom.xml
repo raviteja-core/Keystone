@@ -19,7 +19,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <spring-boot.version>3.4.3</spring-boot.version>
-        <caffeine.version>3.2.0</caffeine.version>
+        <caffeine.version>3.3.0</caffeine.version>
         <junit-jupiter.version>5.12.0</junit-jupiter.version>
         <assertj.version>3.27.3</assertj.version>
         <testcontainers.version>1.20.5</testcontainers.version>
