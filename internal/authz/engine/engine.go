@@ -239,52 +239,17 @@ func (e *Engine) eval(c *evalContext, obj store.Object, name string, depth int, 
 	var err error
 
 	if isRel {
-		// Read tuples for relation
-		tuples, readErr := e.readTuplesWithSemaphore(c, store.TupleFilter{
-			ObjectType: obj.Type,
-			ObjectID:   obj.ID,
-			Relation:   name,
-		})
-		if readErr != nil {
-			return false, false, readErr
-		}
-
-		for _, t := range tuples {
-			// Direct subject match
-			if t.SubjectType == c.subject.Type && t.SubjectID == c.subject.ID && t.SubjectRelation == c.subject.Relation {
-				allowed = true
-				break
-			}
-			// Wildcard subject match (user:*)
-			if t.SubjectType == c.subject.Type && t.SubjectID == "*" && c.subject.Relation == "" {
-				allowed = true
-				break
-			}
-			// Userset subject match (e.g. group:eng#member)
-			if t.SubjectRelation != "" {
-				usersetObj := store.Object{Type: t.SubjectType, ID: t.SubjectID}
-				subAllowed, subCycle, subErr := e.eval(c, usersetObj, t.SubjectRelation, depth+1, pathVisiting)
-				if subErr != nil {
-					return false, false, subErr
-				}
-				if subAllowed {
-					allowed = true
-					if subCycle {
-						hitCycle = true
-					}
-					break
-				}
-				if subCycle {
-					hitCycle = true
-				}
-			}
-		}
-	} else {
-		// Permission expression
-		allowed, hitCycle, err = e.evalExpr(c, permDef.AST, obj, depth, pathVisiting)
+		allowed, err := e.evalRelationBFS(c, obj, name, depth)
 		if err != nil {
 			return false, false, err
 		}
+		return allowed, false, nil
+	}
+
+	// Permission expression
+	allowed, hitCycle, err = e.evalExpr(c, permDef.AST, obj, depth, pathVisiting)
+	if err != nil {
+		return false, false, err
 	}
 
 	// 5. Memoize ONLY if no cycle was hit on this branch
@@ -470,3 +435,81 @@ func (e *Engine) readTuplesWithSemaphore(c *evalContext, filter store.TupleFilte
 	c.dbReads.Add(1)
 	return e.store.ReadTuples(c.ctx, c.tenantID, filter, c.revision)
 }
+
+type usersetNode struct {
+	obj   store.Object
+	rel   string
+	depth int
+}
+
+func (e *Engine) evalRelationBFS(c *evalContext, startObj store.Object, startRel string, depth int) (bool, error) {
+	startKey := memoKey{objectType: startObj.Type, objectID: startObj.ID, name: startRel}
+	if val, ok := c.memo.get(startKey); ok {
+		return val, nil
+	}
+
+	queue := []usersetNode{{obj: startObj, rel: startRel, depth: depth}}
+	visited := make(map[memoKey]bool)
+	visited[startKey] = true
+
+	for len(queue) > 0 {
+		if err := c.ctx.Err(); err != nil {
+			return false, err
+		}
+
+		curr := queue[0]
+		queue = queue[1:]
+
+		c.updateDepth(curr.depth)
+		if curr.depth > c.maxDepth {
+			return false, ErrDepthExceeded
+		}
+
+		tuples, err := e.readTuplesWithSemaphore(c, store.TupleFilter{
+			ObjectType: curr.obj.Type,
+			ObjectID:   curr.obj.ID,
+			Relation:   curr.rel,
+		})
+		if err != nil {
+			return false, err
+		}
+
+		for _, t := range tuples {
+			// 1. Direct subject match
+			if t.SubjectType == c.subject.Type && t.SubjectID == c.subject.ID && t.SubjectRelation == c.subject.Relation {
+				c.memo.set(startKey, true)
+				return true, nil
+			}
+
+			// 2. Wildcard subject match (user:*)
+			if t.SubjectType == c.subject.Type && t.SubjectID == "*" && c.subject.Relation == "" {
+				c.memo.set(startKey, true)
+				return true, nil
+			}
+
+			// 3. Userset subject match (e.g. group:eng#member)
+			if t.SubjectRelation != "" {
+				nextObj := store.Object{Type: t.SubjectType, ID: t.SubjectID}
+				nextKey := memoKey{objectType: nextObj.Type, objectID: nextObj.ID, name: t.SubjectRelation}
+
+				if val, ok := c.memo.get(nextKey); ok && val {
+					c.memo.set(startKey, true)
+					return true, nil
+				}
+
+				if !visited[nextKey] {
+					visited[nextKey] = true
+					queue = append(queue, usersetNode{
+						obj:   nextObj,
+						rel:   t.SubjectRelation,
+						depth: curr.depth + 1,
+					})
+				}
+			}
+		}
+	}
+
+	c.memo.set(startKey, false)
+	return false, nil
+}
+

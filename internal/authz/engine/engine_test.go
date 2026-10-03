@@ -565,6 +565,93 @@ types:
 	t.Logf("Differential Test PASSED: %d checks verified identical across Engine and Oracle! Seed: %d", totalChecks, seed)
 }
 
+func TestCheck_DenseCyclicGroups(t *testing.T) {
+	// 12 groups, each a member of every other, subject in none.
+	// Must finish in well under 100ms with DB reads linear in the number of groups (<= 12 reads).
+	denseGroupSchema := `
+version: 1
+types:
+  user: {}
+  group:
+    relations:
+      member: [user, "group#member"]
+`
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_dense_" + strings.ReplaceAll(uid.String(), "-", "")
+
+	sch, err := schema.ParseAndValidate(denseGroupSchema)
+	if err != nil {
+		t.Fatalf("failed to parse schema: %v", err)
+	}
+
+	_, err = s.SaveSchema(ctx, tenantID, 1, denseGroupSchema, sch)
+	if err != nil {
+		t.Fatalf("failed to save schema: %v", err)
+	}
+
+	const numGroups = 12
+	var writes []store.TupleOperation
+
+	// Each group is a member of every other group (12 * 11 = 132 tuples)
+	for i := 1; i <= numGroups; i++ {
+		for j := 1; j <= numGroups; j++ {
+			if i == j {
+				continue
+			}
+			writes = append(writes, store.TupleOperation{
+				Op: store.OpCreate,
+				Tuple: store.Tuple{
+					ObjectType:      "group",
+					ObjectID:        fmt.Sprintf("g%d", i),
+					Relation:        "member",
+					SubjectType:     "group",
+					SubjectID:       fmt.Sprintf("g%d", j),
+					SubjectRelation: "member",
+				},
+			})
+		}
+	}
+
+	rev, err := s.WriteRelationships(ctx, tenantID, writes)
+	if err != nil {
+		t.Fatalf("failed to write dense relationships: %v", err)
+	}
+
+	eng := engine.New(s, engine.DefaultConfig())
+
+	start := time.Now()
+	res, err := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "group", ID: "g1"},
+		Permission: "member",
+		Subject:    store.Subject{Type: "user", ID: "nobody"},
+	})
+	duration := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("check failed with error: %v", err)
+	}
+
+	if res.Allowed {
+		t.Fatalf("user:nobody should not be allowed in dense groups")
+	}
+
+	t.Logf("Dense cyclic groups check finished in %v with %d DB reads", duration, res.DBReads)
+
+	if res.DBReads > numGroups {
+		t.Fatalf("DB reads (%d) exceeded linear bound of %d groups", res.DBReads, numGroups)
+	}
+
+	if duration > 100*time.Millisecond {
+		t.Fatalf("Dense cyclic groups check took %v, which exceeds 100ms limit", duration)
+	}
+}
+
 func BenchmarkCheck_Cold(b *testing.B) {
 	pool := getTestPoolBench(b)
 	s := store.New(pool)
