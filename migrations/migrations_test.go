@@ -71,3 +71,30 @@ func TestMigrations_Auth_IdempotentAndTriggers(t *testing.T) {
 		t.Fatalf("CRITICAL SECURITY VIOLATION: DELETE on audit_events succeeded; append-only trigger failed")
 	}
 }
+
+func getAuthzDBURL() string {
+	url := os.Getenv("KEYSTONE_AUTHZ_DB_URL")
+	if url == "" {
+		port := os.Getenv("KEYSTONE_POSTGRES_PORT")
+		if port == "" {
+			port = "54320"
+		}
+		url = "postgres://keystone_authz_app:authz_dev_password@localhost:" + port + "/keystone_authz?sslmode=disable"
+	}
+	return url
+}
+
+func TestMigrations_Authz_Idempotent(t *testing.T) {
+	dbURL := getAuthzDBURL()
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	if err := migrations.Run(ctx, logger, dbURL, "authz"); err != nil {
+		t.Fatalf("running authz migrations failed: %v", err)
+	}
+
+	// Running second time must be idempotent
+	if err := migrations.Run(ctx, logger, dbURL, "authz"); err != nil {
+		t.Fatalf("running authz migrations second time failed: %v", err)
+	}
+}
