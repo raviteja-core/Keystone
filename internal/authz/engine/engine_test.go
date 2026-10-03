@@ -192,25 +192,64 @@ func TestCheck_CyclePoisoningDefense(t *testing.T) {
 	// When checking item:1#check_access for alice:
 	// Left branch (loop->check_access):
 	//   eval(item:1, check_access) -> reads loop -> eval(item:2, check_access) -> reads loop -> eval(item:1, check_access)
-	//   item:1 is visiting -> cycle cut-off yields DENIED for this branch!
-	//   Crucially: item:2 on this branch hit the cycle cut-off. If item:2 was cached as DENIED, then:
-	// Right branch (direct->clean_access):
-	//   eval(item:2, clean_access) -> reads member -> finds alice -> ALLOWED!
-	// If the cache was poisoned with item:2=DENIED, the check would wrongly return DENIED.
-	// With cycle-sensitive memoization, it correctly returns ALLOWED!
+	// TestCheck_CyclePoisoningDefense tests that the SAME (object, name) pair
+	// evaluated along a cyclic path (where it returns DENIED due to cycle cut-off)
+	// is NOT memoized as DENIED. When subsequently evaluated along a clean path in
+	// the same Check request, it evaluates to ALLOWED.
+	//
+	// Graph:
+	// root:main#test -> step->run (sequential arrow iteration over step:1, step:2)
+	//
+	// Path 1 (step:1):
+	//   step:1#run = "item->eval - fail"
+	//   step:1#item -> item:k
+	//   item:k#eval = "peer->eval + member"
+	//   item:k#peer -> item:target (tuple 1) and item:clean (tuple 2)
+	//   item:k visits item:target#eval:
+	//     item:target#eval = "peer->eval + member"
+	//     item:target#peer -> item:k
+	//     item:target calls item:k#eval -> CYCLE CUT-OFF! Returns (allowed=false, hitCycle=true).
+	//     item:target has no other peers or member, so item:target#eval returns (allowed=false, hitCycle=true).
+	//   If item:target#eval were memoized as DENIED, the memo cache is poisoned!
+	//   item:k then evaluates tuple 2 (item:clean), which has alice, so item:k succeeds.
+	//   However, step:1 has fail@alice, so step:1#run evaluates to DENIED (exclusion).
+	//
+	// Path 2 (step:2):
+	//   Arrow loop continues to step:2.
+	//   step:2#run = "item->eval - fail" (step:2 has NO fail tuple).
+	//   step:2#item -> item:target (THE EXACT SAME object:name item:target#eval!)
+	//   step:2 evaluates item:target#eval:
+	//     item:target calls item:k#eval.
+	//     On this clean path, item:k is NOT in visiting!
+	//     item:k evaluates item:clean, which has alice -> ALLOWED!
+	//     item:target returns ALLOWED!
+	//   step:2 returns ALLOWED!
+	//   root:main#test returns ALLOWED!
+	//
+	// If the memo cache was poisoned by Path 1, step:2 gets DENIED from cache and test FAILS.
+	// If !hitCycle correctly prevented memoization, step:2 evaluates cleanly and test PASSES.
 
 	cycleSchema := `
 version: 1
 types:
   user: {}
+  root:
+    relations:
+      step: [step]
+    permissions:
+      test: "step->run"
+  step:
+    relations:
+      item: [item]
+      fail: [user]
+    permissions:
+      run: "item->eval - fail"
   item:
     relations:
-      loop:   [item]
-      direct: [item]
+      peer:   [item]
       member: [user]
     permissions:
-      check_access: "loop->check_access + direct->clean_access"
-      clean_access: "member"
+      eval: "peer->eval + member"
 `
 
 	pool := getTestPool(t)
@@ -231,10 +270,26 @@ types:
 	}
 
 	rev, err := s.WriteRelationships(ctx, tenantID, []store.TupleOperation{
-		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "1", Relation: "loop", SubjectType: "item", SubjectID: "2"}},
-		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "2", Relation: "loop", SubjectType: "item", SubjectID: "1"}},
-		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "1", Relation: "direct", SubjectType: "item", SubjectID: "2"}},
-		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "2", Relation: "member", SubjectType: "user", SubjectID: "alice"}},
+		// root steps (step:1 sorted before step:2 in DB)
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "root", ObjectID: "main", Relation: "step", SubjectType: "step", SubjectID: "1"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "root", ObjectID: "main", Relation: "step", SubjectType: "step", SubjectID: "2"}},
+
+		// step:1 points to item:k and has fail@alice
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "step", ObjectID: "1", Relation: "item", SubjectType: "item", SubjectID: "k"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "step", ObjectID: "1", Relation: "fail", SubjectType: "user", SubjectID: "alice"}},
+
+		// step:2 points directly to item:a_target (SAME node) and has NO fail
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "step", ObjectID: "2", Relation: "item", SubjectType: "item", SubjectID: "a_target"}},
+
+		// item:k has peer item:a_target ('a' sorted first) and item:z_clean ('z' sorted second)
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "k", Relation: "peer", SubjectType: "item", SubjectID: "a_target"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "k", Relation: "peer", SubjectType: "item", SubjectID: "z_clean"}},
+
+		// item:a_target has peer item:k (cycles back)
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "a_target", Relation: "peer", SubjectType: "item", SubjectID: "k"}},
+
+		// item:z_clean has alice in member
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "z_clean", Relation: "member", SubjectType: "user", SubjectID: "alice"}},
 	})
 	if err != nil {
 		t.Fatalf("failed to write cycle tuples: %v", err)
@@ -245,8 +300,8 @@ types:
 	res, err := eng.Check(ctx, engine.CheckRequest{
 		TenantID:   tenantID,
 		Revision:   rev,
-		Object:     store.Object{Type: "item", ID: "1"},
-		Permission: "check_access",
+		Object:     store.Object{Type: "root", ID: "main"},
+		Permission: "test",
 		Subject:    store.Subject{Type: "user", ID: "alice"},
 	})
 	if err != nil {
@@ -254,7 +309,7 @@ types:
 	}
 
 	if !res.Allowed {
-		t.Fatalf("CRITICAL: Cycle poisoning bug! Alice should be allowed via direct path, but was denied due to cyclic memo poisoning!")
+		t.Fatalf("CRITICAL: Cycle poisoning bug! Alice should be allowed via step:2 clean evaluation of item:target#eval, but was denied due to memo poisoning from step:1!")
 	}
 }
 
