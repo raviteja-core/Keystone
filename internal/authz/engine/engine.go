@@ -327,13 +327,13 @@ func (e *Engine) evalUnion(c *evalContext, left, right schema.Node, obj store.Ob
 
 	go func() {
 		childC := c.withContext(childCtx)
-		a, hc, err := e.evalExpr(childC, left, obj, depth+1, visiting)
+		a, hc, err := e.evalExpr(childC, left, obj, depth, visiting)
 		results <- evalResult{allowed: a, hitCycle: hc, err: err}
 	}()
 
 	go func() {
 		childC := c.withContext(childCtx)
-		a, hc, err := e.evalExpr(childC, right, obj, depth+1, visiting)
+		a, hc, err := e.evalExpr(childC, right, obj, depth, visiting)
 		results <- evalResult{allowed: a, hitCycle: hc, err: err}
 	}()
 
@@ -372,13 +372,13 @@ func (e *Engine) evalIntersection(c *evalContext, left, right schema.Node, obj s
 
 	go func() {
 		childC := c.withContext(childCtx)
-		a, hc, err := e.evalExpr(childC, left, obj, depth+1, visiting)
+		a, hc, err := e.evalExpr(childC, left, obj, depth, visiting)
 		results <- evalResult{allowed: a, hitCycle: hc, err: err}
 	}()
 
 	go func() {
 		childC := c.withContext(childCtx)
-		a, hc, err := e.evalExpr(childC, right, obj, depth+1, visiting)
+		a, hc, err := e.evalExpr(childC, right, obj, depth, visiting)
 		results <- evalResult{allowed: a, hitCycle: hc, err: err}
 	}()
 
@@ -406,7 +406,7 @@ func (e *Engine) evalIntersection(c *evalContext, left, right schema.Node, obj s
 
 func (e *Engine) evalExclusion(c *evalContext, left, right schema.Node, obj store.Object, depth int, visiting map[memoKey]bool) (bool, bool, error) {
 	// Exclusion: Left must be ALLOWED and Right must be DENIED
-	leftAllowed, leftCycle, leftErr := e.evalExpr(c, left, obj, depth+1, visiting)
+	leftAllowed, leftCycle, leftErr := e.evalExpr(c, left, obj, depth, visiting)
 	if leftErr != nil {
 		return false, false, leftErr
 	}
@@ -416,7 +416,7 @@ func (e *Engine) evalExclusion(c *evalContext, left, right schema.Node, obj stor
 		return false, leftCycle, nil
 	}
 
-	rightAllowed, rightCycle, rightErr := e.evalExpr(c, right, obj, depth+1, visiting)
+	rightAllowed, rightCycle, rightErr := e.evalExpr(c, right, obj, depth, visiting)
 	if rightErr != nil {
 		return false, false, rightErr
 	}

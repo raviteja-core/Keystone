@@ -402,6 +402,120 @@ types:
 	}
 }
 
+func TestCheck_DepthLimit_TransitionsOnly(t *testing.T) {
+	// Tests that depth limit counts only (object,name) -> (object,name) transitions,
+	// and does NOT increment on internal AST nodes (like union operators).
+	// With MaxDepth = 25:
+	// - 10-hop parent->view chain must PASS.
+	// - 30-hop parent->view chain must RETURN ErrDepthExceeded.
+
+	folderSchema := `
+version: 1
+types:
+  user: {}
+  folder:
+    relations:
+      parent: [folder]
+      viewer: [user]
+    permissions:
+      # Has binary union node: viewer + parent->view
+      view: "viewer + parent->view"
+`
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_depth_trans_" + strings.ReplaceAll(uid.String(), "-", "")
+
+	sch, err := schema.ParseAndValidate(folderSchema)
+	if err != nil {
+		t.Fatalf("failed to parse schema: %v", err)
+	}
+	_, err = s.SaveSchema(ctx, tenantID, 1, folderSchema, sch)
+	if err != nil {
+		t.Fatalf("failed to save schema: %v", err)
+	}
+
+	// Build a 30-hop chain:
+	// folder:1 -> folder:2 -> ... -> folder:30 -> folder:31
+	// folder:11 has viewer: alice (target for 10-hop chain starting at folder:1)
+	// folder:31 has viewer: bob   (target for 30-hop chain starting at folder:1)
+	var writes []store.TupleOperation
+	for i := 1; i <= 30; i++ {
+		writes = append(writes, store.TupleOperation{
+			Op: store.OpCreate,
+			Tuple: store.Tuple{
+				ObjectType:  "folder",
+				ObjectID:    fmt.Sprintf("%d", i),
+				Relation:    "parent",
+				SubjectType: "folder",
+				SubjectID:   fmt.Sprintf("%d", i+1),
+			},
+		})
+	}
+	writes = append(writes, store.TupleOperation{
+		Op: store.OpCreate,
+		Tuple: store.Tuple{
+			ObjectType:  "folder",
+			ObjectID:    "11", // 10 hops from folder:1
+			Relation:    "viewer",
+			SubjectType: "user",
+			SubjectID:   "alice",
+		},
+	})
+	writes = append(writes, store.TupleOperation{
+		Op: store.OpCreate,
+		Tuple: store.Tuple{
+			ObjectType:  "folder",
+			ObjectID:    "31", // 30 hops from folder:1
+			Relation:    "viewer",
+			SubjectType: "user",
+			SubjectID:   "bob",
+		},
+	})
+
+	rev, err := s.WriteRelationships(ctx, tenantID, writes)
+	if err != nil {
+		t.Fatalf("failed to write hierarchy: %v", err)
+	}
+
+	eng := engine.New(s, engine.Config{
+		MaxDepth:       25,
+		MaxConcurrency: 4,
+		Timeout:        5 * time.Second,
+	})
+
+	// 1. 10-hop parent->view chain for alice: MUST PASS with MaxDepth 25!
+	res10, err10 := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "folder", ID: "1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "alice"},
+	})
+	if err10 != nil {
+		t.Fatalf("10-hop chain failed unexpectedly: %v", err10)
+	}
+	if !res10.Allowed {
+		t.Fatalf("10-hop chain expected allowed=true for alice, got false")
+	}
+	t.Logf("10-hop chain succeeded as expected with depth=%d", res10.Depth)
+
+	// 2. 30-hop parent->view chain for bob: MUST FAIL with ErrDepthExceeded with MaxDepth 25!
+	_, err30 := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "folder", ID: "1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "bob"},
+	})
+	if !errors.Is(err30, engine.ErrDepthExceeded) {
+		t.Fatalf("30-hop chain expected ErrDepthExceeded, got err=%v", err30)
+	}
+	t.Logf("30-hop chain correctly returned ErrDepthExceeded")
+}
+
 func TestDifferential_EngineVsOracle_10000Checks(t *testing.T) {
 	// Randomized differential testing: 10,000 checks comparing Engine vs naive Oracle.
 	seed := time.Now().UnixNano()
