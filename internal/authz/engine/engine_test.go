@@ -1036,6 +1036,125 @@ types:
 	}
 }
 
+func TestCheck_RejectWildcardSubject(t *testing.T) {
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_reject_wc_" + strings.ReplaceAll(uid.String(), "-", "")
+	eng, _, rev := setupEngineWithSchema(t, tenantID)
+	ctx := context.Background()
+
+	// Check with Subject.ID = "*" must be rejected!
+	_, err := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "doc", ID: "1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "*"},
+	})
+	if !errors.Is(err, store.ErrInvalidIdentifier) {
+		t.Fatalf("expected ErrInvalidIdentifier when subject id is '*', got %v", err)
+	}
+}
+
+func TestCheck_ArrowIgnoresUsersetAndWildcard(t *testing.T) {
+	arrowSchema := `
+version: 1
+types:
+  user: {}
+  group:
+    relations:
+      member: [user]
+  folder:
+    relations:
+      viewer: [user]
+    permissions:
+      view: "viewer"
+  doc:
+    relations:
+      parent: [folder]
+    permissions:
+      view: "parent->view"
+`
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_arrow_ignore_" + strings.ReplaceAll(uid.String(), "-", "")
+
+	sch, err := schema.ParseAndValidate(arrowSchema)
+	if err != nil {
+		t.Fatalf("failed to parse schema: %v", err)
+	}
+	_, err = s.SaveSchema(ctx, tenantID, 1, arrowSchema, sch)
+	if err != nil {
+		t.Fatalf("failed to save schema: %v", err)
+	}
+
+	// Write valid tuples: doc:1#parent@folder:f1, folder:f1#viewer@user:alice
+	rev, err := s.WriteRelationships(ctx, tenantID, []store.TupleOperation{
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "doc", ObjectID: "1", Relation: "parent", SubjectType: "folder", SubjectID: "f1"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "folder", ObjectID: "f1", Relation: "viewer", SubjectType: "user", SubjectID: "alice"}},
+	})
+	if err != nil {
+		t.Fatalf("failed to write relationships: %v", err)
+	}
+
+	// Insert legacy/raw tuples on doc#parent with userset and wildcard directly to test arrow tolerance.
+	// The arrow evaluation parent->view must ignore both userset and wildcard, and follow folder:f1.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO authz_tuples (tenant_id, object_type, object_id, relation, subject_type, subject_id, subject_relation, created_rev)
+		VALUES 
+			($1, 'doc', '1', 'parent', 'group', 'g1', 'member', $2),
+			($1, 'doc', '1', 'parent', 'user', '*', '', $2)
+	`, tenantID, rev)
+	if err != nil {
+		t.Fatalf("failed to insert raw legacy tuples: %v", err)
+	}
+
+	eng := engine.New(s, engine.DefaultConfig())
+
+	res, err := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "doc", ID: "1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "alice"},
+	})
+	if err != nil {
+		t.Fatalf("check failed with error: %v", err)
+	}
+	if !res.Allowed {
+		t.Fatalf("expected allowed=true via valid folder target, got false")
+	}
+}
+
+func TestCheck_SchemaCache(t *testing.T) {
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_sch_cache_" + strings.ReplaceAll(uid.String(), "-", "")
+	eng, _, rev := setupEngineWithSchema(t, tenantID)
+	ctx := context.Background()
+
+	req := engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "doc", ID: "1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "alice"},
+	}
+
+	// First call loads into cache
+	_, err := eng.Check(ctx, req)
+	if err != nil {
+		t.Fatalf("first check failed: %v", err)
+	}
+
+	// Second call uses cache (hits schemaCache)
+	_, err = eng.Check(ctx, req)
+	if err != nil {
+		t.Fatalf("second check failed: %v", err)
+	}
+}
+
 func BenchmarkCheck_Cold(b *testing.B) {
 	pool := getTestPoolBench(b)
 	s := store.New(pool)

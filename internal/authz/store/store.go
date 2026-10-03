@@ -144,6 +144,56 @@ func (s *Store) GetLatestSchema(ctx context.Context, tenantID string) (*schema.S
 	return &sch, version, nil
 }
 
+// GetLatestSchemaVersion returns the newest schema version number for a tenant.
+func (s *Store) GetLatestSchemaVersion(ctx context.Context, tenantID string) (int, error) {
+	if !ValidateID(tenantID, false) {
+		return 0, fmt.Errorf("%w: invalid tenant id %q", ErrInvalidIdentifier, tenantID)
+	}
+
+	var version int
+	err := s.pool.QueryRow(ctx, `
+		SELECT version
+		FROM authz_schemas
+		WHERE tenant_id = $1
+		ORDER BY version DESC
+		LIMIT 1
+	`, tenantID).Scan(&version)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNoSchema
+		}
+		return 0, err
+	}
+	return version, nil
+}
+
+// GetSchemaByVersion returns the compiled schema for a specific version.
+func (s *Store) GetSchemaByVersion(ctx context.Context, tenantID string, version int) (*schema.Schema, error) {
+	if !ValidateID(tenantID, false) {
+		return nil, fmt.Errorf("%w: invalid tenant id %q", ErrInvalidIdentifier, tenantID)
+	}
+
+	var parsedJSON []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT parsed
+		FROM authz_schemas
+		WHERE tenant_id = $1 AND version = $2
+	`, tenantID, version).Scan(&parsedJSON)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNoSchema
+		}
+		return nil, err
+	}
+
+	var sch schema.Schema
+	if err := json.Unmarshal(parsedJSON, &sch); err != nil {
+		return nil, fmt.Errorf("failed to deserialize schema: %w", err)
+	}
+
+	return &sch, nil
+}
+
 // WriteRelationships executes a batch of relationship writes atomically in ONE transaction.
 func (s *Store) WriteRelationships(ctx context.Context, tenantID string, ops []TupleOperation) (int64, error) {
 	if !ValidateID(tenantID, false) {

@@ -23,6 +23,7 @@ type Engine struct {
 	maxDepth       int
 	maxConcurrency int
 	timeout        time.Duration
+	schemaCache    sync.Map // keyed by "tenantID:version", value *schema.Schema
 }
 
 // Config holds configuration options for the check engine.
@@ -139,6 +140,26 @@ func cloneVisiting(v map[memoKey]bool) map[memoKey]bool {
 	return c
 }
 
+func (e *Engine) loadSchema(ctx context.Context, tenantID string) (*schema.Schema, error) {
+	ver, err := e.store.GetLatestSchemaVersion(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	cacheKey := fmt.Sprintf("%s:%d", tenantID, ver)
+	if cached, ok := e.schemaCache.Load(cacheKey); ok {
+		return cached.(*schema.Schema), nil
+	}
+
+	sch, err := e.store.GetSchemaByVersion(ctx, tenantID, ver)
+	if err != nil {
+		return nil, err
+	}
+
+	e.schemaCache.Store(cacheKey, sch)
+	return sch, nil
+}
+
 // Check evaluates whether a subject has a permission on an object at a given revision.
 func (e *Engine) Check(ctx context.Context, req CheckRequest) (*CheckResponse, error) {
 	if req.TenantID == "" {
@@ -156,15 +177,15 @@ func (e *Engine) Check(ctx context.Context, req CheckRequest) (*CheckResponse, e
 	if !store.ValidateTypeOrRelation(req.Subject.Type) {
 		return nil, fmt.Errorf("%w: invalid subject type %q", store.ErrInvalidIdentifier, req.Subject.Type)
 	}
-	if !store.ValidateID(req.Subject.ID, true) {
-		return nil, fmt.Errorf("%w: invalid subject id %q", store.ErrInvalidIdentifier, req.Subject.ID)
+	if req.Subject.ID == "*" || !store.ValidateID(req.Subject.ID, false) {
+		return nil, fmt.Errorf("%w: subject id cannot be wildcard '*' or invalid %q", store.ErrInvalidIdentifier, req.Subject.ID)
 	}
 
 	evalCtxTimeout, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 
-	// Load schema for tenant
-	sch, _, err := e.store.GetLatestSchema(evalCtxTimeout, req.TenantID)
+	// Load schema for tenant using versioned schema cache
+	sch, err := e.loadSchema(evalCtxTimeout, req.TenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -282,6 +303,12 @@ func (e *Engine) evalExpr(c *evalContext, node schema.Node, obj store.Object, de
 
 		var hitCycle bool
 		for _, t := range tuples {
+			// Arrows only traverse direct object references.
+			// Ignore tuples that have a userset subject or "*".
+			if t.SubjectRelation != "" || t.SubjectID == "*" {
+				continue
+			}
+
 			targetObj := store.Object{Type: t.SubjectType, ID: t.SubjectID}
 			subAllowed, subCycle, subErr := e.eval(c, targetObj, n.Permission, depth+1, visiting)
 			if subErr != nil {
@@ -326,12 +353,22 @@ func (e *Engine) evalUnion(c *evalContext, left, right schema.Node, obj store.Ob
 	results := make(chan evalResult, 2)
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				results <- evalResult{err: fmt.Errorf("evaluator panic: %v", r)}
+			}
+		}()
 		childC := c.withContext(childCtx)
 		a, hc, err := e.evalExpr(childC, left, obj, depth, visiting)
 		results <- evalResult{allowed: a, hitCycle: hc, err: err}
 	}()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				results <- evalResult{err: fmt.Errorf("evaluator panic: %v", r)}
+			}
+		}()
 		childC := c.withContext(childCtx)
 		a, hc, err := e.evalExpr(childC, right, obj, depth, visiting)
 		results <- evalResult{allowed: a, hitCycle: hc, err: err}
@@ -371,12 +408,22 @@ func (e *Engine) evalIntersection(c *evalContext, left, right schema.Node, obj s
 	results := make(chan evalResult, 2)
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				results <- evalResult{err: fmt.Errorf("evaluator panic: %v", r)}
+			}
+		}()
 		childC := c.withContext(childCtx)
 		a, hc, err := e.evalExpr(childC, left, obj, depth, visiting)
 		results <- evalResult{allowed: a, hitCycle: hc, err: err}
 	}()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				results <- evalResult{err: fmt.Errorf("evaluator panic: %v", r)}
+			}
+		}()
 		childC := c.withContext(childCtx)
 		a, hc, err := e.evalExpr(childC, right, obj, depth, visiting)
 		results <- evalResult{allowed: a, hitCycle: hc, err: err}
@@ -518,4 +565,3 @@ func (e *Engine) evalRelationBFS(c *evalContext, startObj store.Object, startRel
 	c.memo.set(startKey, false)
 	return false, nil
 }
-
