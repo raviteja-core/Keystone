@@ -344,6 +344,64 @@ func TestCheck_FailClosed(t *testing.T) {
 	}
 }
 
+func TestCheck_ExclusionSafety_SubtrahendCycleCutoff(t *testing.T) {
+	// Exclusion safety: if the subtrahend of a - b evaluates to DENIED while having hit
+	// a cycle cut-off, the engine must return ErrCycleCutoffInSubtrahend (fail closed),
+	// never granting access based on an uncertain denial.
+	exclusionSchema := `
+version: 1
+types:
+  user: {}
+  item:
+    relations:
+      loop:  [item]
+      allow: [user]
+    permissions:
+      cycle_perm: "loop->cycle_perm"
+      safe_perm:  "allow - cycle_perm"
+`
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_excl_safe_" + strings.ReplaceAll(uid.String(), "-", "")
+
+	sch, err := schema.ParseAndValidate(exclusionSchema)
+	if err != nil {
+		t.Fatalf("failed to parse schema: %v", err)
+	}
+	_, err = s.SaveSchema(ctx, tenantID, 1, exclusionSchema, sch)
+	if err != nil {
+		t.Fatalf("failed to save schema: %v", err)
+	}
+
+	// Create graph: item:1 allows alice, but subtrahend cycle_perm loops between 1 and 2
+	rev, err := s.WriteRelationships(ctx, tenantID, []store.TupleOperation{
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "1", Relation: "allow", SubjectType: "user", SubjectID: "alice"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "1", Relation: "loop", SubjectType: "item", SubjectID: "2"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "item", ObjectID: "2", Relation: "loop", SubjectType: "item", SubjectID: "1"}},
+	})
+	if err != nil {
+		t.Fatalf("failed to write relationships: %v", err)
+	}
+
+	eng := engine.New(s, engine.DefaultConfig())
+
+	res, err := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "item", ID: "1"},
+		Permission: "safe_perm",
+		Subject:    store.Subject{Type: "user", ID: "alice"},
+	})
+
+	if !errors.Is(err, engine.ErrCycleCutoffInSubtrahend) {
+		t.Fatalf("expected ErrCycleCutoffInSubtrahend, got res=%v, err=%v", res, err)
+	}
+	t.Logf("Exclusion safety verified: correctly failed closed with ErrCycleCutoffInSubtrahend")
+}
+
 func TestCheck_DepthLimit(t *testing.T) {
 	// Construct deep chain exceeding maxDepth (configured to 5)
 	chainSchema := `

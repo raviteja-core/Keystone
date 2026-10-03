@@ -11,6 +11,7 @@ var (
 	ErrUnknownType                 = errors.New("unknown object type")
 	ErrUnknownRelationOrPermission = errors.New("unknown relation or permission")
 	ErrInvalidSubject              = errors.New("invalid subject")
+	ErrCycleCutoffInSubtrahend     = errors.New("exclusion subtrahend hit cycle cut-off")
 )
 
 // CheckRequest encapsulates the parameters for an authorization check.

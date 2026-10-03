@@ -421,6 +421,12 @@ func (e *Engine) evalExclusion(c *evalContext, left, right schema.Node, obj stor
 		return false, false, rightErr
 	}
 
+	// Exclusion safety: If the subtrahend (right) evaluated to DENIED while having hit a cycle cut-off,
+	// fail closed by returning an error so uncertain denials can never grant access.
+	if !rightAllowed && rightCycle {
+		return false, true, ErrCycleCutoffInSubtrahend
+	}
+
 	return !rightAllowed, leftCycle || rightCycle, nil
 }
 
