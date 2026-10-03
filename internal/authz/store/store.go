@@ -504,6 +504,89 @@ func (s *Store) ReadTuples(ctx context.Context, tenantID string, filter TupleFil
 	return result, rows.Err()
 }
 
+// CheckSubjectOrWildcardExists checks if a specific subject or subject-type wildcard exists on an object relation at revision.
+func (s *Store) CheckSubjectOrWildcardExists(ctx context.Context, tenantID string, obj Object, relation string, subject Subject, revision int64) (bool, error) {
+	if !ValidateID(tenantID, false) {
+		return false, fmt.Errorf("%w: invalid tenant id %q", ErrInvalidIdentifier, tenantID)
+	}
+	if !ValidateTypeOrRelation(obj.Type) || !ValidateID(obj.ID, false) {
+		return false, fmt.Errorf("%w: invalid object %s:%s", ErrInvalidIdentifier, obj.Type, obj.ID)
+	}
+	if !ValidateTypeOrRelation(relation) {
+		return false, fmt.Errorf("%w: invalid relation %q", ErrInvalidIdentifier, relation)
+	}
+	if !ValidateTypeOrRelation(subject.Type) || !ValidateID(subject.ID, false) {
+		return false, fmt.Errorf("%w: invalid subject %s:%s", ErrInvalidIdentifier, subject.Type, subject.ID)
+	}
+
+	query := `
+		SELECT EXISTS (
+			SELECT 1 FROM authz_tuples
+			WHERE tenant_id = $1
+			  AND object_type = $2
+			  AND object_id = $3
+			  AND relation = $4
+			  AND (
+				  (subject_type = $5 AND subject_id = $6 AND subject_relation = $7)
+				  OR
+				  (subject_type = $5 AND subject_id = '*' AND subject_relation = '')
+			  )
+			  AND created_rev <= $8
+			  AND (deleted_rev IS NULL OR deleted_rev > $8)
+		)
+	`
+	var exists bool
+	err := s.pool.QueryRow(ctx, query, tenantID, obj.Type, obj.ID, relation, subject.Type, subject.ID, subject.Relation, revision).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// ReadUsersetTuples retrieves only tuples that point to usersets (subject_relation != ”) on an object relation at revision.
+func (s *Store) ReadUsersetTuples(ctx context.Context, tenantID string, obj Object, relation string, revision int64) ([]Tuple, error) {
+	if !ValidateID(tenantID, false) {
+		return nil, fmt.Errorf("%w: invalid tenant id %q", ErrInvalidIdentifier, tenantID)
+	}
+	if !ValidateTypeOrRelation(obj.Type) || !ValidateID(obj.ID, false) {
+		return nil, fmt.Errorf("%w: invalid object %s:%s", ErrInvalidIdentifier, obj.Type, obj.ID)
+	}
+	if !ValidateTypeOrRelation(relation) {
+		return nil, fmt.Errorf("%w: invalid relation %q", ErrInvalidIdentifier, relation)
+	}
+
+	query := `
+		SELECT object_type, object_id, relation, subject_type, subject_id, subject_relation, created_rev, deleted_rev
+		FROM authz_tuples
+		WHERE tenant_id = $1
+		  AND object_type = $2
+		  AND object_id = $3
+		  AND relation = $4
+		  AND subject_relation != ''
+		  AND created_rev <= $5
+		  AND (deleted_rev IS NULL OR deleted_rev > $5)
+		ORDER BY subject_type, subject_id, subject_relation
+	`
+
+	rows, err := s.pool.Query(ctx, query, tenantID, obj.Type, obj.ID, relation, revision)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Tuple
+	for rows.Next() {
+		var t Tuple
+		t.TenantID = tenantID
+		if err := rows.Scan(&t.ObjectType, &t.ObjectID, &t.Relation, &t.SubjectType, &t.SubjectID, &t.SubjectRelation, &t.CreatedRev, &t.DeletedRev); err != nil {
+			return nil, err
+		}
+		result = append(result, t)
+	}
+
+	return result, rows.Err()
+}
+
 // ValidateTupleAgainstSchema verifies that a tuple adheres to the tenant's current schema.
 func ValidateTupleAgainstSchema(sch *schema.Schema, t *Tuple) error {
 	typeDef, ok := sch.Types[t.ObjectType]

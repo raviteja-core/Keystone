@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/raviteja-core/keystone/internal/authz/store"
 )
@@ -12,6 +13,10 @@ var (
 	ErrUnknownRelationOrPermission = errors.New("unknown relation or permission")
 	ErrInvalidSubject              = errors.New("invalid subject")
 	ErrCycleCutoffInSubtrahend     = errors.New("exclusion subtrahend hit cycle cut-off")
+	ErrResourceExhausted           = errors.New("resource limit exceeded during check evaluation")
+	ErrMaxDBReadsExceeded          = fmt.Errorf("%w: max db reads limit exceeded", ErrResourceExhausted)
+	ErrMaxRowsPerReadExceeded      = fmt.Errorf("%w: max rows per read limit exceeded", ErrResourceExhausted)
+	ErrMaxVisitedNodesExceeded     = fmt.Errorf("%w: max visited nodes limit exceeded", ErrResourceExhausted)
 )
 
 // CheckRequest encapsulates the parameters for an authorization check.

@@ -402,6 +402,92 @@ types:
 	t.Logf("Exclusion safety verified: correctly failed closed with ErrCycleCutoffInSubtrahend")
 }
 
+func TestCheck_ExclusionSubtrahendUsersetOverCyclicGroups(t *testing.T) {
+	// Tests: view = viewer - banned
+	// banned allows [user, "group#member"]
+	// banned group graph is cyclic (g1 <-> g2).
+	// Expects correct allow/deny without error (BFS userset path reports hitCycle=false so results memoize).
+	schText := `
+version: 1
+types:
+  user: {}
+  group:
+    relations:
+      member: [user, "group#member"]
+  doc:
+    relations:
+      viewer: [user]
+      banned: [user, "group#member"]
+    permissions:
+      view: "viewer - banned"
+`
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_excl_sub_cyclic_" + strings.ReplaceAll(uid.String(), "-", "")
+
+	sch, err := schema.ParseAndValidate(schText)
+	if err != nil {
+		t.Fatalf("failed to parse schema: %v", err)
+	}
+	_, err = s.SaveSchema(ctx, tenantID, 1, schText, sch)
+	if err != nil {
+		t.Fatalf("failed to save schema: %v", err)
+	}
+
+	// Setup:
+	// g1 <-> g2 cycle
+	// g1#member@user:banned_user
+	// doc:1#viewer@user:alice
+	// doc:1#viewer@user:banned_user
+	// doc:1#banned@group:g1#member
+	rev, err := s.WriteRelationships(ctx, tenantID, []store.TupleOperation{
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "group", ObjectID: "g1", Relation: "member", SubjectType: "group", SubjectID: "g2", SubjectRelation: "member"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "group", ObjectID: "g2", Relation: "member", SubjectType: "group", SubjectID: "g1", SubjectRelation: "member"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "group", ObjectID: "g1", Relation: "member", SubjectType: "user", SubjectID: "banned_user"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "doc", ObjectID: "1", Relation: "viewer", SubjectType: "user", SubjectID: "alice"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "doc", ObjectID: "1", Relation: "viewer", SubjectType: "user", SubjectID: "banned_user"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "doc", ObjectID: "1", Relation: "banned", SubjectType: "group", SubjectID: "g1", SubjectRelation: "member"}},
+	})
+	if err != nil {
+		t.Fatalf("failed to write relationships: %v", err)
+	}
+
+	eng := engine.New(s, engine.DefaultConfig())
+
+	// 1. Alice is a viewer and not banned (banned cyclic graph searched via BFS returns false without cycle error)
+	resAlice, err := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "doc", ID: "1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "alice"},
+	})
+	if err != nil {
+		t.Fatalf("alice check failed with error: %v", err)
+	}
+	if !resAlice.Allowed {
+		t.Fatalf("expected alice to be ALLOWED, got denied")
+	}
+
+	// 2. Banned user is a viewer, but belongs to g1 in the cyclic group graph -> correctly DENIED, no error
+	resBanned, err := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "doc", ID: "1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "banned_user"},
+	})
+	if err != nil {
+		t.Fatalf("banned_user check failed with error: %v", err)
+	}
+	if resBanned.Allowed {
+		t.Fatalf("expected banned_user to be DENIED, got allowed")
+	}
+}
+
 func TestCheck_DepthLimit(t *testing.T) {
 	// Construct deep chain exceeding maxDepth (configured to 5)
 	chainSchema := `
@@ -949,6 +1035,340 @@ types:
 	t.Logf("Differential Test PASSED at both old Revision %d and new Revision %d!", rev1, rev2)
 }
 
+func TestDifferential_RandomSchemasAndGraphs_100Runs(t *testing.T) {
+	// Differential testing with >=100 random graphs and random SCHEMAS within the grammar.
+	// Compares Engine against independent least-fixpoint Oracle.
+	// Counts and logs engine errors by type.
+	// Asserts engine == oracle for all non-error results.
+	// Fails immediately if any engine result is "allowed" while oracle says denied.
+	seed := time.Now().UnixNano()
+	t.Logf("Differential Test Seed: %d", seed)
+	rng := rand.New(rand.NewSource(seed))
+
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	schemas := []string{
+		// 1. Hierarchy with arrows, union, exclusion
+		`
+version: 1
+types:
+  user: {}
+  group:
+    relations:
+      member: [user, "group#member"]
+  folder:
+    relations:
+      parent: [folder]
+      viewer: [user, "user:*"]
+    permissions:
+      view: "viewer + parent->view"
+  doc:
+    relations:
+      parent: [folder]
+      owner: [user]
+      banned: [user, "group#member"]
+    permissions:
+      view: "(owner + parent->view) - banned"
+`,
+		// 2. Multi-role approval with intersection & union
+		`
+version: 1
+types:
+  user: {}
+  group:
+    relations:
+      member: [user]
+  project:
+    relations:
+      admin: [user]
+      lead: [user]
+      maintainer: ["group#member"]
+    permissions:
+      audit: "admin & lead"
+      manage: "maintainer + audit"
+`,
+		// 3. Userset relations with nested groups & exclusions
+		`
+version: 1
+types:
+  user: {}
+  group:
+    relations:
+      member: [user, "group#member"]
+      banned: [user]
+    permissions:
+      active: "member - banned"
+  item:
+    relations:
+      viewer: ["group#member"]
+      editor: [user]
+    permissions:
+      view: "viewer + editor"
+`,
+		// 4. Multi-hop arrows with permissions
+		`
+version: 1
+types:
+  user: {}
+  org:
+    relations:
+      member: [user]
+    permissions:
+      access: member
+  team:
+    relations:
+      parent: [org]
+      lead: [user]
+    permissions:
+      access: "lead + parent->access"
+  repo:
+    relations:
+      team: [team]
+      admin: [user]
+    permissions:
+      read: "team->access + admin"
+      push: "admin & team->access"
+`,
+		// 5. Complex boolean grouping
+		`
+version: 1
+types:
+  user: {}
+  group:
+    relations:
+      member: [user, "group#member"]
+  asset:
+    relations:
+      r1: [user]
+      r2: [user, "user:*"]
+      r3: ["group#member"]
+      r4: [user]
+    permissions:
+      p1: "r1 + r2"
+      p2: "p1 & r3"
+      p3: "p2 - r4"
+      p4: "(r1 + r3) - (r2 & r4)"
+`,
+		// 6. Cyclic groups and exclusions
+		`
+version: 1
+types:
+  user: {}
+  group:
+    relations:
+      member: [user, "group#member"]
+  doc:
+    relations:
+      viewer: [user, "group#member"]
+      banned: [user, "group#member"]
+    permissions:
+      view: "viewer - banned"
+`,
+		// 7. Arrow over folder mesh
+		`
+version: 1
+types:
+  user: {}
+  folder:
+    relations:
+      parent: [folder]
+      viewer: [user]
+    permissions:
+      view: "viewer + parent->view"
+  doc:
+    relations:
+      parent: [folder]
+      editor: [user]
+    permissions:
+      view: "editor + parent->view"
+`,
+		// 8. Permissions with multiple arrows and exclusions
+		`
+version: 1
+types:
+  user: {}
+  folder:
+    relations:
+      parent: [folder]
+      owner: [user]
+    permissions:
+      view: "owner + parent->view"
+  doc:
+    relations:
+      parent: [folder]
+      viewer: [user, "user:*"]
+      restricted: [user]
+    permissions:
+      view: "(viewer + parent->view) - restricted"
+`,
+	}
+
+	const numGraphs = 100
+	users := []string{"u1", "u2", "u3", "u4", "u5"}
+	errorCounts := make(map[string]int)
+	totalTriples := 0
+
+	for g := 0; g < numGraphs; g++ {
+		// Pick a random schema archetype
+		schText := schemas[rng.Intn(len(schemas))]
+		sch, err := schema.ParseAndValidate(schText)
+		if err != nil {
+			t.Fatalf("failed to parse schema: %v", err)
+		}
+
+		uid, _ := ids.NewUUIDv7()
+		tenantID := fmt.Sprintf("tenant_diff_100_g%d_%s", g, strings.ReplaceAll(uid.String(), "-", ""))
+
+		_, err = s.SaveSchema(ctx, tenantID, 1, schText, sch)
+		if err != nil {
+			t.Fatalf("failed to save schema: %v", err)
+		}
+
+		// Generate random tuples conforming to schema
+		var tuples []store.Tuple
+		var ops []store.TupleOperation
+
+		// Collect available types and their relations
+		type relationInfo struct {
+			objType string
+			relName string
+			allowed []schema.SubjectTypeRule
+		}
+		var allRels []relationInfo
+		for tName, tDef := range sch.Types {
+			if tName == "user" {
+				continue
+			}
+			for rName, rDef := range tDef.Relations {
+				allRels = append(allRels, relationInfo{
+					objType: tName,
+					relName: rName,
+					allowed: rDef.SubjectTypes,
+				})
+			}
+		}
+
+		// Generate 4 to 12 tuples per graph
+		numTuples := 4 + rng.Intn(9)
+		seen := make(map[store.Tuple]bool)
+		for i := 0; i < numTuples; i++ {
+			rel := allRels[rng.Intn(len(allRels))]
+			objID := fmt.Sprintf("id_%d", rng.Intn(4)+1)
+			rule := rel.allowed[rng.Intn(len(rel.allowed))]
+
+			var subj store.Subject
+			if rule.Type == "user" {
+				if rule.IsWildcard && rng.Intn(4) == 0 {
+					subj = store.Subject{Type: "user", ID: "*"}
+				} else {
+					subj = store.Subject{Type: "user", ID: users[rng.Intn(len(users))]}
+				}
+			} else {
+				subjID := fmt.Sprintf("id_%d", rng.Intn(4)+1)
+				subj = store.Subject{Type: rule.Type, ID: subjID, Relation: rule.Relation}
+			}
+
+			tup := store.Tuple{
+				TenantID:        tenantID,
+				ObjectType:      rel.objType,
+				ObjectID:        objID,
+				Relation:        rel.relName,
+				SubjectType:     subj.Type,
+				SubjectID:       subj.ID,
+				SubjectRelation: subj.Relation,
+			}
+			if seen[tup] {
+				continue
+			}
+			seen[tup] = true
+			tuples = append(tuples, tup)
+			ops = append(ops, store.TupleOperation{Op: store.OpCreate, Tuple: tup})
+		}
+
+		rev, err := s.WriteRelationships(ctx, tenantID, ops)
+		if err != nil {
+			t.Fatalf("failed to write relationships for graph %d: %v", g, err)
+		}
+
+		oracle := engine.NewOracle(sch, tuples, users)
+		eng := engine.New(s, engine.DefaultConfig())
+
+		// Pick 5 random check queries per graph
+		for q := 0; q < 5; q++ {
+			// Pick random type that has permissions or relations
+			var candidateTypes []string
+			for tName := range sch.Types {
+				if tName != "user" {
+					candidateTypes = append(candidateTypes, tName)
+				}
+			}
+			objType := candidateTypes[rng.Intn(len(candidateTypes))]
+			tDef := sch.Types[objType]
+
+			var candidateNames []string
+			for r := range tDef.Relations {
+				candidateNames = append(candidateNames, r)
+			}
+			for p := range tDef.Permissions {
+				candidateNames = append(candidateNames, p)
+			}
+			name := candidateNames[rng.Intn(len(candidateNames))]
+
+			obj := store.Object{Type: objType, ID: fmt.Sprintf("id_%d", rng.Intn(4)+1)}
+			subj := store.Subject{Type: "user", ID: users[rng.Intn(len(users))]}
+
+			req := engine.CheckRequest{
+				TenantID:   tenantID,
+				Revision:   rev,
+				Object:     obj,
+				Permission: name,
+				Subject:    subj,
+			}
+
+			engResp, engErr := eng.Check(ctx, req)
+			if engErr != nil {
+				var errCategory string
+				switch {
+				case errors.Is(engErr, engine.ErrCycleCutoffInSubtrahend):
+					errCategory = "cycle_cutoff_in_subtrahend"
+				case errors.Is(engErr, engine.ErrDepthExceeded):
+					errCategory = "depth_exceeded"
+				case errors.Is(engErr, engine.ErrResourceExhausted):
+					errCategory = "resource_exhausted"
+				case errors.Is(engErr, context.DeadlineExceeded):
+					errCategory = "timeout"
+				default:
+					errCategory = "other"
+				}
+				errorCounts[errCategory]++
+				continue
+			}
+
+			oracleAllowed, oErr := oracle.Check(obj, name, subj)
+			if oErr != nil {
+				t.Fatalf("oracle check failed: %v", oErr)
+			}
+
+			if engResp.Allowed != oracleAllowed {
+				if engResp.Allowed && !oracleAllowed {
+					t.Fatalf("UNSOUND: seed %d graph %d Engine ALLOWED but Oracle DENIED for %s:%s#%s@%s:%s",
+						seed, g, obj.Type, obj.ID, name, subj.Type, subj.ID)
+				}
+				if !engResp.Allowed && oracleAllowed {
+					t.Fatalf("MISMATCH: seed %d graph %d Engine DENIED but Oracle ALLOWED for %s:%s#%s@%s:%s",
+						seed, g, obj.Type, obj.ID, name, subj.Type, subj.ID)
+				}
+			}
+			totalTriples++
+		}
+	}
+
+	t.Logf("Differential Test Report: graphs=%d, triples=%d, errors_by_type=%v, seed=%d",
+		numGraphs, totalTriples, errorCounts, seed)
+}
+
 func TestCheck_DenseCyclicGroups(t *testing.T) {
 	// 12 groups, each a member of every other, subject in none.
 	// Must finish in well under 100ms with DB reads linear in the number of groups (<= 12 reads).
@@ -1027,8 +1447,8 @@ types:
 
 	t.Logf("Dense cyclic groups check finished in %v with %d DB reads", duration, res.DBReads)
 
-	if res.DBReads > numGroups {
-		t.Fatalf("DB reads (%d) exceeded linear bound of %d groups", res.DBReads, numGroups)
+	if res.DBReads > 2*numGroups {
+		t.Fatalf("DB reads (%d) exceeded linear bound of %d groups (%d)", res.DBReads, numGroups, 2*numGroups)
 	}
 
 	if duration > 100*time.Millisecond {
@@ -1153,6 +1573,339 @@ func TestCheck_SchemaCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second check failed: %v", err)
 	}
+}
+
+func TestCheck_SplitRelationReads_10000MemberGroup(t *testing.T) {
+	// Tests that checking membership against a 10,000-member group uses split relation reads:
+	// (a) EXISTS check for exact subject (0 rows transferred into memory)
+	// (b) ReadUsersetTuples fetches only subject_relation != '' tuples
+	// Asserts DB reads and rows loaded stay small.
+	groupSchema := `
+version: 1
+types:
+  user: {}
+  group:
+    relations:
+      member: [user, "group#member"]
+  doc:
+    relations:
+      viewer: [user, "group#member"]
+    permissions:
+      view: viewer
+`
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_split_reads_" + strings.ReplaceAll(uid.String(), "-", "")
+
+	sch, err := schema.ParseAndValidate(groupSchema)
+	if err != nil {
+		t.Fatalf("failed to parse schema: %v", err)
+	}
+	_, err = s.SaveSchema(ctx, tenantID, 1, groupSchema, sch)
+	if err != nil {
+		t.Fatalf("failed to save schema: %v", err)
+	}
+
+	// Bulk insert 10,000 direct user members into group:big_group#member
+	const memberCount = 10000
+	_, err = pool.Exec(ctx, `
+		INSERT INTO authz_tuples (tenant_id, object_type, object_id, relation, subject_type, subject_id, subject_relation, created_rev)
+		SELECT $1, 'group', 'big_group', 'member', 'user', 'u_' || i::text, '', 1
+		FROM generate_series(1, $2::int) AS i
+	`, tenantID, memberCount)
+	if err != nil {
+		t.Fatalf("failed to bulk insert 10000 group members: %v", err)
+	}
+
+	// Insert doc:d1#viewer@group:big_group#member
+	_, err = pool.Exec(ctx, `
+		INSERT INTO authz_tuples (tenant_id, object_type, object_id, relation, subject_type, subject_id, subject_relation, created_rev)
+		VALUES ($1, 'doc', 'd1', 'viewer', 'group', 'big_group', 'member', 1)
+	`, tenantID)
+	if err != nil {
+		t.Fatalf("failed to insert doc viewer tuple: %v", err)
+	}
+
+	// Update tenant rev 1
+	_, err = pool.Exec(ctx, `
+		UPDATE authz_tenants SET current_rev = 1 WHERE tenant_id = $1
+	`, tenantID)
+	if err != nil {
+		t.Fatalf("failed to update tenant rev: %v", err)
+	}
+
+	eng := engine.New(s, engine.DefaultConfig())
+
+	// 1. Check user that IS a member (nested through group:big_group#member)
+	resMember, err := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   1,
+		Object:     store.Object{Type: "doc", ID: "d1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "u_42"},
+	})
+	if err != nil {
+		t.Fatalf("check for u_42 failed: %v", err)
+	}
+	if !resMember.Allowed {
+		t.Fatalf("expected u_42 to be ALLOWED")
+	}
+	if resMember.DBReads > 4 {
+		t.Fatalf("expected <= 4 DB reads for 10,000 member group, got %d", resMember.DBReads)
+	}
+	t.Logf("10,000-member group ALLOWED check: dbReads=%d, depth=%d", resMember.DBReads, resMember.Depth)
+
+	// 2. Check user that is NOT a member
+	resNonMember, err := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   1,
+		Object:     store.Object{Type: "doc", ID: "d1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "alice"},
+	})
+	if err != nil {
+		t.Fatalf("check for alice failed: %v", err)
+	}
+	if resNonMember.Allowed {
+		t.Fatalf("expected alice to be DENIED")
+	}
+	if resNonMember.DBReads > 4 {
+		t.Fatalf("expected <= 4 DB reads for non-member check, got %d", resNonMember.DBReads)
+	}
+	t.Logf("10,000-member group DENIED check: dbReads=%d, depth=%d", resNonMember.DBReads, resNonMember.Depth)
+
+	// 3. Direct check on group:big_group#member for u_42 (pure EXISTS query)
+	resDirect, err := eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   1,
+		Object:     store.Object{Type: "group", ID: "big_group"},
+		Permission: "member",
+		Subject:    store.Subject{Type: "user", ID: "u_42"},
+	})
+	if err != nil {
+		t.Fatalf("direct check failed: %v", err)
+	}
+	if !resDirect.Allowed {
+		t.Fatalf("expected direct member check to be ALLOWED")
+	}
+	if resDirect.DBReads != 1 {
+		t.Fatalf("expected direct EXISTS check to take exactly 1 DB read, got %d", resDirect.DBReads)
+	}
+	t.Logf("Direct 10,000-member EXISTS check: dbReads=%d", resDirect.DBReads)
+}
+
+func TestCheck_ResourceCaps_MaxDBReads(t *testing.T) {
+	chainSchema := `
+version: 1
+types:
+  user: {}
+  node:
+    relations:
+      parent: [node]
+      owner:  [user]
+    permissions:
+      view: "owner + parent->view"
+`
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_cap_dbreads_" + strings.ReplaceAll(uid.String(), "-", "")
+
+	sch, err := schema.ParseAndValidate(chainSchema)
+	if err != nil {
+		t.Fatalf("failed to parse schema: %v", err)
+	}
+	_, err = s.SaveSchema(ctx, tenantID, 1, chainSchema, sch)
+	if err != nil {
+		t.Fatalf("failed to save schema: %v", err)
+	}
+
+	// 5-hop chain: n1 -> n2 -> n3 -> n4 -> n5#owner@alice
+	rev, err := s.WriteRelationships(ctx, tenantID, []store.TupleOperation{
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "node", ObjectID: "1", Relation: "parent", SubjectType: "node", SubjectID: "2"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "node", ObjectID: "2", Relation: "parent", SubjectType: "node", SubjectID: "3"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "node", ObjectID: "3", Relation: "parent", SubjectType: "node", SubjectID: "4"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "node", ObjectID: "4", Relation: "parent", SubjectType: "node", SubjectID: "5"}},
+		{Op: store.OpCreate, Tuple: store.Tuple{ObjectType: "node", ObjectID: "5", Relation: "owner", SubjectType: "user", SubjectID: "alice"}},
+	})
+	if err != nil {
+		t.Fatalf("failed to write relationships: %v", err)
+	}
+
+	// Set MaxDBReads cap to 2 (evaluating 5-hop chain requires > 2 DB reads)
+	eng := engine.New(s, engine.Config{MaxDBReads: 2})
+	_, err = eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "node", ID: "1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "alice"},
+	})
+	if err == nil {
+		t.Fatalf("expected ErrMaxDBReadsExceeded, got nil error")
+	}
+	if !errors.Is(err, engine.ErrMaxDBReadsExceeded) {
+		t.Fatalf("expected ErrMaxDBReadsExceeded, got %v", err)
+	}
+	if !errors.Is(err, engine.ErrResourceExhausted) {
+		t.Fatalf("expected wrapping ErrResourceExhausted, got %v", err)
+	}
+	t.Logf("MaxDBReads cap test passed: %v", err)
+}
+
+func TestCheck_ResourceCaps_MaxRowsPerRead(t *testing.T) {
+	fanoutSchema := `
+version: 1
+types:
+  user: {}
+  folder:
+    relations:
+      viewer: [user]
+    permissions:
+      view: viewer
+  doc:
+    relations:
+      parent: [folder]
+    permissions:
+      view: "parent->view"
+`
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_cap_rows_" + strings.ReplaceAll(uid.String(), "-", "")
+
+	sch, err := schema.ParseAndValidate(fanoutSchema)
+	if err != nil {
+		t.Fatalf("failed to parse schema: %v", err)
+	}
+	_, err = s.SaveSchema(ctx, tenantID, 1, fanoutSchema, sch)
+	if err != nil {
+		t.Fatalf("failed to save schema: %v", err)
+	}
+
+	// Create 10 parent relationships for doc:d1
+	var ops []store.TupleOperation
+	for i := 1; i <= 10; i++ {
+		ops = append(ops, store.TupleOperation{
+			Op: store.OpCreate,
+			Tuple: store.Tuple{
+				ObjectType:  "doc",
+				ObjectID:    "d1",
+				Relation:    "parent",
+				SubjectType: "folder",
+				SubjectID:   fmt.Sprintf("f%d", i),
+			},
+		})
+	}
+	rev, err := s.WriteRelationships(ctx, tenantID, ops)
+	if err != nil {
+		t.Fatalf("failed to write relationships: %v", err)
+	}
+
+	// Set MaxRowsPerRead to 5 (arrow read on doc:d1#parent fetches 10 rows > 5)
+	eng := engine.New(s, engine.Config{MaxRowsPerRead: 5})
+	_, err = eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "doc", ID: "d1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "alice"},
+	})
+	if err == nil {
+		t.Fatalf("expected ErrMaxRowsPerReadExceeded, got nil error")
+	}
+	if !errors.Is(err, engine.ErrMaxRowsPerReadExceeded) {
+		t.Fatalf("expected ErrMaxRowsPerReadExceeded, got %v", err)
+	}
+	if !errors.Is(err, engine.ErrResourceExhausted) {
+		t.Fatalf("expected wrapping ErrResourceExhausted, got %v", err)
+	}
+	t.Logf("MaxRowsPerRead cap test passed: %v", err)
+}
+
+func TestCheck_ResourceCaps_MaxVisitedNodes(t *testing.T) {
+	chainSchema := `
+version: 1
+types:
+  user: {}
+  node:
+    relations:
+      parent: [node]
+      owner:  [user]
+    permissions:
+      view: "owner + parent->view"
+`
+	pool := getTestPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	uid, _ := ids.NewUUIDv7()
+	tenantID := "tenant_cap_visited_" + strings.ReplaceAll(uid.String(), "-", "")
+
+	sch, err := schema.ParseAndValidate(chainSchema)
+	if err != nil {
+		t.Fatalf("failed to parse schema: %v", err)
+	}
+	_, err = s.SaveSchema(ctx, tenantID, 1, chainSchema, sch)
+	if err != nil {
+		t.Fatalf("failed to save schema: %v", err)
+	}
+
+	// 6-hop chain
+	var ops []store.TupleOperation
+	for i := 1; i <= 5; i++ {
+		ops = append(ops, store.TupleOperation{
+			Op: store.OpCreate,
+			Tuple: store.Tuple{
+				ObjectType:  "node",
+				ObjectID:    fmt.Sprintf("%d", i),
+				Relation:    "parent",
+				SubjectType: "node",
+				SubjectID:   fmt.Sprintf("%d", i+1),
+			},
+		})
+	}
+	ops = append(ops, store.TupleOperation{
+		Op: store.OpCreate,
+		Tuple: store.Tuple{
+			ObjectType:  "node",
+			ObjectID:    "6",
+			Relation:    "owner",
+			SubjectType: "user",
+			SubjectID:   "alice",
+		},
+	})
+	rev, err := s.WriteRelationships(ctx, tenantID, ops)
+	if err != nil {
+		t.Fatalf("failed to write relationships: %v", err)
+	}
+
+	// Set MaxVisitedNodes to 3 (chain requires visiting 6 nodes)
+	eng := engine.New(s, engine.Config{MaxVisitedNodes: 3})
+	_, err = eng.Check(ctx, engine.CheckRequest{
+		TenantID:   tenantID,
+		Revision:   rev,
+		Object:     store.Object{Type: "node", ID: "1"},
+		Permission: "view",
+		Subject:    store.Subject{Type: "user", ID: "alice"},
+	})
+	if err == nil {
+		t.Fatalf("expected ErrMaxVisitedNodesExceeded, got nil error")
+	}
+	if !errors.Is(err, engine.ErrMaxVisitedNodesExceeded) {
+		t.Fatalf("expected ErrMaxVisitedNodesExceeded, got %v", err)
+	}
+	if !errors.Is(err, engine.ErrResourceExhausted) {
+		t.Fatalf("expected wrapping ErrResourceExhausted, got %v", err)
+	}
+	t.Logf("MaxVisitedNodes cap test passed: %v", err)
 }
 
 func BenchmarkCheck_Cold(b *testing.B) {

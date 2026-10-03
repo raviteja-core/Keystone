@@ -12,33 +12,45 @@ import (
 )
 
 const (
-	DefaultMaxDepth       = 25
-	DefaultMaxConcurrency = 16
-	DefaultCheckTimeout   = 500 * time.Millisecond
+	DefaultMaxDepth        = 25
+	DefaultMaxConcurrency  = 16
+	DefaultCheckTimeout    = 500 * time.Millisecond
+	DefaultMaxDBReads      = 1000
+	DefaultMaxRowsPerRead  = 1000
+	DefaultMaxVisitedNodes = 5000
 )
 
 // Engine evaluates relationship-based access control checks with Zanzibar semantics.
 type Engine struct {
-	store          *store.Store
-	maxDepth       int
-	maxConcurrency int
-	timeout        time.Duration
-	schemaCache    sync.Map // keyed by "tenantID:version", value *schema.Schema
+	store             *store.Store
+	maxDepth          int
+	maxConcurrency    int
+	timeout           time.Duration
+	maxDBReads        int
+	maxRowsPerRead    int
+	maxVisitedNodes   int
+	tenantSchemaCache sync.Map // keyed by tenantID, value *schema.Schema
 }
 
 // Config holds configuration options for the check engine.
 type Config struct {
-	MaxDepth       int
-	MaxConcurrency int
-	Timeout        time.Duration
+	MaxDepth        int
+	MaxConcurrency  int
+	Timeout         time.Duration
+	MaxDBReads      int
+	MaxRowsPerRead  int
+	MaxVisitedNodes int
 }
 
 // DefaultConfig provides recommended defaults.
 func DefaultConfig() Config {
 	return Config{
-		MaxDepth:       DefaultMaxDepth,
-		MaxConcurrency: DefaultMaxConcurrency,
-		Timeout:        DefaultCheckTimeout,
+		MaxDepth:        DefaultMaxDepth,
+		MaxConcurrency:  DefaultMaxConcurrency,
+		Timeout:         DefaultCheckTimeout,
+		MaxDBReads:      DefaultMaxDBReads,
+		MaxRowsPerRead:  DefaultMaxRowsPerRead,
+		MaxVisitedNodes: DefaultMaxVisitedNodes,
 	}
 }
 
@@ -53,13 +65,30 @@ func New(s *store.Store, cfg Config) *Engine {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultCheckTimeout
 	}
+	if cfg.MaxDBReads <= 0 {
+		cfg.MaxDBReads = DefaultMaxDBReads
+	}
+	if cfg.MaxRowsPerRead <= 0 {
+		cfg.MaxRowsPerRead = DefaultMaxRowsPerRead
+	}
+	if cfg.MaxVisitedNodes <= 0 {
+		cfg.MaxVisitedNodes = DefaultMaxVisitedNodes
+	}
 
 	return &Engine{
-		store:          s,
-		maxDepth:       cfg.MaxDepth,
-		maxConcurrency: cfg.MaxConcurrency,
-		timeout:        cfg.Timeout,
+		store:           s,
+		maxDepth:        cfg.MaxDepth,
+		maxConcurrency:  cfg.MaxConcurrency,
+		timeout:         cfg.Timeout,
+		maxDBReads:      cfg.MaxDBReads,
+		maxRowsPerRead:  cfg.MaxRowsPerRead,
+		maxVisitedNodes: cfg.MaxVisitedNodes,
 	}
+}
+
+// InvalidateSchema removes a tenant's cached schema.
+func (e *Engine) InvalidateSchema(tenantID string) {
+	e.tenantSchemaCache.Delete(tenantID)
 }
 
 type memoKey struct {
@@ -93,30 +122,38 @@ func (mc *memoCache) set(key memoKey, val bool) {
 }
 
 type evalContext struct {
-	ctx          context.Context
-	tenantID     string
-	revision     int64
-	subject      store.Subject
-	schema       *schema.Schema
-	maxDepth     int
-	maxDepthSeen *atomic.Int64
-	dbReads      *atomic.Int64
-	dbSem        chan struct{}
-	memo         *memoCache
+	ctx             context.Context
+	tenantID        string
+	revision        int64
+	subject         store.Subject
+	schema          *schema.Schema
+	maxDepth        int
+	maxDepthSeen    *atomic.Int64
+	dbReads         *atomic.Int64
+	visitedNodes    *atomic.Int64
+	maxDBReads      int
+	maxRowsPerRead  int
+	maxVisitedNodes int
+	dbSem           chan struct{}
+	memo            *memoCache
 }
 
 func (c *evalContext) withContext(ctx context.Context) *evalContext {
 	return &evalContext{
-		ctx:          ctx,
-		tenantID:     c.tenantID,
-		revision:     c.revision,
-		subject:      c.subject,
-		schema:       c.schema,
-		maxDepth:     c.maxDepth,
-		maxDepthSeen: c.maxDepthSeen,
-		dbReads:      c.dbReads,
-		dbSem:        c.dbSem,
-		memo:         c.memo,
+		ctx:             ctx,
+		tenantID:        c.tenantID,
+		revision:        c.revision,
+		subject:         c.subject,
+		schema:          c.schema,
+		maxDepth:        c.maxDepth,
+		maxDepthSeen:    c.maxDepthSeen,
+		dbReads:         c.dbReads,
+		visitedNodes:    c.visitedNodes,
+		maxDBReads:      c.maxDBReads,
+		maxRowsPerRead:  c.maxRowsPerRead,
+		maxVisitedNodes: c.maxVisitedNodes,
+		dbSem:           c.dbSem,
+		memo:            c.memo,
 	}
 }
 
@@ -141,22 +178,16 @@ func cloneVisiting(v map[memoKey]bool) map[memoKey]bool {
 }
 
 func (e *Engine) loadSchema(ctx context.Context, tenantID string) (*schema.Schema, error) {
-	ver, err := e.store.GetLatestSchemaVersion(ctx, tenantID)
-	if err != nil {
-		return nil, err
-	}
-
-	cacheKey := fmt.Sprintf("%s:%d", tenantID, ver)
-	if cached, ok := e.schemaCache.Load(cacheKey); ok {
+	if cached, ok := e.tenantSchemaCache.Load(tenantID); ok {
 		return cached.(*schema.Schema), nil
 	}
 
-	sch, err := e.store.GetSchemaByVersion(ctx, tenantID, ver)
+	sch, _, err := e.store.GetLatestSchema(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
 
-	e.schemaCache.Store(cacheKey, sch)
+	e.tenantSchemaCache.Store(tenantID, sch)
 	return sch, nil
 }
 
@@ -191,16 +222,20 @@ func (e *Engine) Check(ctx context.Context, req CheckRequest) (*CheckResponse, e
 	}
 
 	c := &evalContext{
-		ctx:          evalCtxTimeout,
-		tenantID:     req.TenantID,
-		revision:     req.Revision,
-		subject:      req.Subject,
-		schema:       sch,
-		maxDepth:     e.maxDepth,
-		maxDepthSeen: &atomic.Int64{},
-		dbReads:      &atomic.Int64{},
-		dbSem:        make(chan struct{}, e.maxConcurrency),
-		memo:         newMemoCache(),
+		ctx:             evalCtxTimeout,
+		tenantID:        req.TenantID,
+		revision:        req.Revision,
+		subject:         req.Subject,
+		schema:          sch,
+		maxDepth:        e.maxDepth,
+		maxDepthSeen:    &atomic.Int64{},
+		dbReads:         &atomic.Int64{},
+		visitedNodes:    &atomic.Int64{},
+		maxDBReads:      e.maxDBReads,
+		maxRowsPerRead:  e.maxRowsPerRead,
+		maxVisitedNodes: e.maxVisitedNodes,
+		dbSem:           make(chan struct{}, e.maxConcurrency),
+		memo:            newMemoCache(),
 	}
 
 	allowed, _, err := e.eval(c, req.Object, req.Permission, 1, make(map[memoKey]bool))
@@ -224,6 +259,9 @@ func (e *Engine) eval(c *evalContext, obj store.Object, name string, depth int, 
 	c.updateDepth(depth)
 	if depth > c.maxDepth {
 		return false, false, ErrDepthExceeded
+	}
+	if c.maxVisitedNodes > 0 && c.visitedNodes.Add(1) > int64(c.maxVisitedNodes) {
+		return false, false, ErrMaxVisitedNodesExceeded
 	}
 
 	key := memoKey{objectType: obj.Type, objectID: obj.ID, name: name}
@@ -478,6 +516,9 @@ func (e *Engine) evalExclusion(c *evalContext, left, right schema.Node, obj stor
 }
 
 func (e *Engine) readTuplesWithSemaphore(c *evalContext, filter store.TupleFilter) ([]store.Tuple, error) {
+	if c.maxDBReads > 0 && c.dbReads.Add(1) > int64(c.maxDBReads) {
+		return nil, ErrMaxDBReadsExceeded
+	}
 	select {
 	case <-c.ctx.Done():
 		return nil, c.ctx.Err()
@@ -485,8 +526,49 @@ func (e *Engine) readTuplesWithSemaphore(c *evalContext, filter store.TupleFilte
 	}
 	defer func() { <-c.dbSem }()
 
-	c.dbReads.Add(1)
-	return e.store.ReadTuples(c.ctx, c.tenantID, filter, c.revision)
+	tuples, err := e.store.ReadTuples(c.ctx, c.tenantID, filter, c.revision)
+	if err != nil {
+		return nil, err
+	}
+	if c.maxRowsPerRead > 0 && len(tuples) > c.maxRowsPerRead {
+		return nil, ErrMaxRowsPerReadExceeded
+	}
+	return tuples, nil
+}
+
+func (e *Engine) checkSubjectExistsWithSemaphore(c *evalContext, obj store.Object, relation string, subject store.Subject) (bool, error) {
+	if c.maxDBReads > 0 && c.dbReads.Add(1) > int64(c.maxDBReads) {
+		return false, ErrMaxDBReadsExceeded
+	}
+	select {
+	case <-c.ctx.Done():
+		return false, c.ctx.Err()
+	case c.dbSem <- struct{}{}:
+	}
+	defer func() { <-c.dbSem }()
+
+	return e.store.CheckSubjectOrWildcardExists(c.ctx, c.tenantID, obj, relation, subject, c.revision)
+}
+
+func (e *Engine) readUsersetTuplesWithSemaphore(c *evalContext, obj store.Object, relation string) ([]store.Tuple, error) {
+	if c.maxDBReads > 0 && c.dbReads.Add(1) > int64(c.maxDBReads) {
+		return nil, ErrMaxDBReadsExceeded
+	}
+	select {
+	case <-c.ctx.Done():
+		return nil, c.ctx.Err()
+	case c.dbSem <- struct{}{}:
+	}
+	defer func() { <-c.dbSem }()
+
+	tuples, err := e.store.ReadUsersetTuples(c.ctx, c.tenantID, obj, relation, c.revision)
+	if err != nil {
+		return nil, err
+	}
+	if c.maxRowsPerRead > 0 && len(tuples) > c.maxRowsPerRead {
+		return nil, ErrMaxRowsPerReadExceeded
+	}
+	return tuples, nil
 }
 
 type usersetNode struct {
@@ -517,47 +599,42 @@ func (e *Engine) evalRelationBFS(c *evalContext, startObj store.Object, startRel
 		if curr.depth > c.maxDepth {
 			return false, ErrDepthExceeded
 		}
+		if c.maxVisitedNodes > 0 && c.visitedNodes.Add(1) > int64(c.maxVisitedNodes) {
+			return false, ErrMaxVisitedNodesExceeded
+		}
 
-		tuples, err := e.readTuplesWithSemaphore(c, store.TupleFilter{
-			ObjectType: curr.obj.Type,
-			ObjectID:   curr.obj.ID,
-			Relation:   curr.rel,
-		})
+		// (a) Fast EXISTS check for exact subject or type wildcard
+		exists, err := e.checkSubjectExistsWithSemaphore(c, curr.obj, curr.rel, c.subject)
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			c.memo.set(startKey, true)
+			return true, nil
+		}
+
+		// (b) Fetch only userset-subject tuples
+		usersets, err := e.readUsersetTuplesWithSemaphore(c, curr.obj, curr.rel)
 		if err != nil {
 			return false, err
 		}
 
-		for _, t := range tuples {
-			// 1. Direct subject match
-			if t.SubjectType == c.subject.Type && t.SubjectID == c.subject.ID && t.SubjectRelation == c.subject.Relation {
+		for _, t := range usersets {
+			nextObj := store.Object{Type: t.SubjectType, ID: t.SubjectID}
+			nextKey := memoKey{objectType: nextObj.Type, objectID: nextObj.ID, name: t.SubjectRelation}
+
+			if val, ok := c.memo.get(nextKey); ok && val {
 				c.memo.set(startKey, true)
 				return true, nil
 			}
 
-			// 2. Wildcard subject match (user:*)
-			if t.SubjectType == c.subject.Type && t.SubjectID == "*" && c.subject.Relation == "" {
-				c.memo.set(startKey, true)
-				return true, nil
-			}
-
-			// 3. Userset subject match (e.g. group:eng#member)
-			if t.SubjectRelation != "" {
-				nextObj := store.Object{Type: t.SubjectType, ID: t.SubjectID}
-				nextKey := memoKey{objectType: nextObj.Type, objectID: nextObj.ID, name: t.SubjectRelation}
-
-				if val, ok := c.memo.get(nextKey); ok && val {
-					c.memo.set(startKey, true)
-					return true, nil
-				}
-
-				if !visited[nextKey] {
-					visited[nextKey] = true
-					queue = append(queue, usersetNode{
-						obj:   nextObj,
-						rel:   t.SubjectRelation,
-						depth: curr.depth + 1,
-					})
-				}
+			if !visited[nextKey] {
+				visited[nextKey] = true
+				queue = append(queue, usersetNode{
+					obj:   nextObj,
+					rel:   t.SubjectRelation,
+					depth: curr.depth + 1,
+				})
 			}
 		}
 	}
