@@ -40,6 +40,7 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.64.5
+          install-mode: goinstall
 
   go-test:
     name: Go Test (-race)
@@ -54,8 +55,19 @@ jobs:
           go-version: '1.26.x'
           cache: true
 
+      - name: Start PostgreSQL
+        run: |
+          docker compose up -d --wait postgres
+
+      - name: Run Database Migrations
+        run: go test -v -count=1 ./migrations
+
       - name: Run Tests with Race Detector
         run: go test -race -v -count=1 -coverprofile=coverage.out ./...
+
+      - name: Teardown Services
+        if: always()
+        run: docker compose down -v
 
   go-vuln:
     name: Govulncheck
