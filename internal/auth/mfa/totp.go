@@ -97,7 +97,7 @@ func VerifyCode(secret, code string, lastUsedStep int64, now time.Time) (int64, 
 		h := mac.Sum(nil)
 
 		offset := h[len(h)-1] & 0x0f
-		binaryCode := binary.BigEndian.Uint32(h[offset : offset+4]) & 0x7fffffff
+		binaryCode := binary.BigEndian.Uint32(h[offset:offset+4]) & 0x7fffffff
 		expectedCode := fmt.Sprintf("%06d", binaryCode%1000000)
 
 		if subtle.ConstantTimeCompare([]byte(code), []byte(expectedCode)) == 1 {

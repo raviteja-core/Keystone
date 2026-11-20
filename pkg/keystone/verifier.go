@@ -24,14 +24,11 @@ type VerifierOption func(*verifierConfig)
 
 type verifierConfig struct {
 	jwksURL            string
-	httpClient         *httpDoer
 	clockSkew          time.Duration
 	keyProvider        KeyProvider
 	jwksTTL            time.Duration
 	minRefetchInterval time.Duration
 }
-
-type httpDoer = func() // placeholder or use *http.Client
 
 // WithJWKSURL sets a custom JWKS URL.
 func WithJWKSURL(url string) VerifierOption {

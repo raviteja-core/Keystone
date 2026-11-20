@@ -8,9 +8,9 @@ import (
 )
 
 const (
-	UserSchemaCore = "urn:ietf:params:scim:schemas:core:2.0:User"
+	UserSchemaCore     = "urn:ietf:params:scim:schemas:core:2.0:User"
 	ListResponseSchema = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
-	ErrorSchema = "urn:ietf:params:scim:api:messages:2.0:Error"
+	ErrorSchema        = "urn:ietf:params:scim:api:messages:2.0:Error"
 
 	ContentTypeSCIM = "application/scim+json; charset=utf-8"
 )

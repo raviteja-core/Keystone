@@ -16,7 +16,7 @@ func TestMemoryCache_GetSetInvalidate(t *testing.T) {
 	key := "tenant1:doc:123#view@user:alice"
 
 	// 1. Initial miss
-	allowed, found, err := c.Get(ctx, key)
+	_, found, err := c.Get(ctx, key)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestMemoryCache_GetSetInvalidate(t *testing.T) {
 	}
 
 	// 3. Cache hit
-	allowed, found, err = c.Get(ctx, key)
+	allowed, found, err := c.Get(ctx, key)
 	if err != nil || !found || !allowed {
 		t.Errorf("expected hit with allowed=true, got found=%v, allowed=%v, err=%v", found, allowed, err)
 	}
