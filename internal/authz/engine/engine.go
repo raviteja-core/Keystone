@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/raviteja-core/keystone/internal/authz/cache"
 	"github.com/raviteja-core/keystone/internal/authz/schema"
 	"github.com/raviteja-core/keystone/internal/authz/store"
 )
@@ -23,6 +24,7 @@ const (
 // Engine evaluates relationship-based access control checks with Zanzibar semantics.
 type Engine struct {
 	store             *store.Store
+	cache             cache.Cache
 	maxDepth          int
 	maxConcurrency    int
 	timeout           time.Duration
@@ -89,6 +91,11 @@ func New(s *store.Store, cfg Config) *Engine {
 // InvalidateSchema removes a tenant's cached schema.
 func (e *Engine) InvalidateSchema(tenantID string) {
 	e.tenantSchemaCache.Delete(tenantID)
+}
+
+// SetCache attaches a check cache to the engine.
+func (e *Engine) SetCache(c cache.Cache) {
+	e.cache = c
 }
 
 type memoKey struct {
@@ -212,6 +219,19 @@ func (e *Engine) Check(ctx context.Context, req CheckRequest) (*CheckResponse, e
 		return nil, fmt.Errorf("%w: subject id cannot be wildcard '*' or invalid %q", store.ErrInvalidIdentifier, req.Subject.ID)
 	}
 
+	cacheKey := fmt.Sprintf("%s:%s:%s#%s@%s:%s:%d", req.TenantID, req.Object.Type, req.Object.ID, req.Permission, req.Subject.Type, req.Subject.ID, req.Revision)
+	if e.cache != nil {
+		if allowed, found, err := e.cache.Get(ctx, cacheKey); err == nil && found {
+			return &CheckResponse{
+				Allowed:  allowed,
+				Revision: req.Revision,
+				Depth:    0,
+				DBReads:  0,
+				Cached:   true,
+			}, nil
+		}
+	}
+
 	evalCtxTimeout, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 
@@ -241,6 +261,10 @@ func (e *Engine) Check(ctx context.Context, req CheckRequest) (*CheckResponse, e
 	allowed, _, err := e.eval(c, req.Object, req.Permission, 1, make(map[memoKey]bool))
 	if err != nil {
 		return nil, err
+	}
+
+	if e.cache != nil {
+		_ = e.cache.Set(ctx, cacheKey, allowed, 10*time.Second)
 	}
 
 	return &CheckResponse{

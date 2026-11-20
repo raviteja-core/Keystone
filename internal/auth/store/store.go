@@ -274,6 +274,80 @@ func (s *Store) ResetFailedLogin(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
+// ListUsers returns paginated users and the total count.
+func (s *Store) ListUsers(ctx context.Context, offset, limit int) ([]*User, int, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	var total int
+	err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM users").Scan(&total)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to count users: %w", err)
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, email, email_verified, username, display_name, password_hash,
+		       status, external_id, mfa_enabled, failed_login_count, locked_until,
+		       version, created_at, updated_at
+		FROM users
+		ORDER BY created_at ASC
+		LIMIT $1 OFFSET $2
+	`, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to query users: %w", err)
+	}
+	defer rows.Close()
+
+	users := make([]*User, 0)
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(
+			&u.ID, &u.Email, &u.EmailVerified, &u.Username, &u.DisplayName, &u.PasswordHash,
+			&u.Status, &u.ExternalID, &u.MFAEnabled, &u.FailedLoginCount, &u.LockedUntil,
+			&u.Version, &u.CreatedAt, &u.UpdatedAt,
+		); err != nil {
+			return nil, 0, fmt.Errorf("failed to scan user: %w", err)
+		}
+		users = append(users, &u)
+	}
+	return users, total, nil
+}
+
+// UpdateUser updates user attributes.
+func (s *Store) UpdateUser(ctx context.Context, u *User) error {
+	u.UpdatedAt = time.Now()
+	query := `
+		UPDATE users
+		SET email = $2, username = $3, display_name = $4, status = $5,
+		    updated_at = $6, version = version + 1
+		WHERE id = $1
+	`
+	tag, err := s.pool.Exec(ctx, query, u.ID, u.Email, u.Username, u.DisplayName, u.Status, u.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to update user: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteUser deletes a user by ID.
+func (s *Store) DeleteUser(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx, "DELETE FROM users WHERE id = $1", id)
+	if err != nil {
+		return fmt.Errorf("failed to delete user: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // -------------------------------------------------------------------------
 // Client Operations
 // -------------------------------------------------------------------------

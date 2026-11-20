@@ -191,3 +191,46 @@ func (w *Writer) Record(ctx context.Context, e Event) (*Record, error) {
 		Hash:      eventHash,
 	}, nil
 }
+
+// VerifyChain traverses audit events from oldest to newest, verifying that every event's prev_hash
+// strictly matches the prior event's hash, and the genesis event begins with 32 zero bytes.
+// Returns the count of verified events.
+func VerifyChain(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+	if pool == nil {
+		return 0, errors.New("pool is nil")
+	}
+
+	rows, err := pool.Query(ctx, `
+		SELECT id, prev_hash, hash
+		FROM audit_events
+		ORDER BY id ASC
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query audit events: %w", err)
+	}
+	defer rows.Close()
+
+	count := 0
+	expectedPrevHash := make([]byte, 32) // Genesis block expects 32 zero bytes
+
+	for rows.Next() {
+		var id int64
+		var prevHash, hash []byte
+		if err := rows.Scan(&id, &prevHash, &hash); err != nil {
+			return count, fmt.Errorf("failed to scan row at index %d: %w", count, err)
+		}
+
+		if len(prevHash) != len(expectedPrevHash) || string(prevHash) != string(expectedPrevHash) {
+			return count, fmt.Errorf("tamper detected at record ID %d: expected prev_hash %x, found %x", id, expectedPrevHash, prevHash)
+		}
+
+		expectedPrevHash = hash
+		count++
+	}
+
+	if err := rows.Err(); err != nil {
+		return count, fmt.Errorf("rows iteration error: %w", err)
+	}
+
+	return count, nil
+}

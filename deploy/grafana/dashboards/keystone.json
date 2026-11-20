@@ -1,0 +1,77 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "Keystone HTTP Request Rate (req/sec)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(keystone_http_requests_total[1m])) by (service, status)",
+          "legendFormat": "{{service}} - status {{status}}"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "title": "Keystone Latency p95 (seconds)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(keystone_http_request_duration_seconds_bucket[1m])) by (le, service))",
+          "legendFormat": "{{service}} p95"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "title": "Auth Server Token Grants & Logins",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(keystone_token_issued_total[1m])) by (grant_type)",
+          "legendFormat": "Token Grant ({{grant_type}})"
+        },
+        {
+          "expr": "sum(rate(keystone_auth_login_total[1m])) by (result)",
+          "legendFormat": "Login ({{result}})"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "title": "Authz Zanzibar Checks & Cache Ratio",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(keystone_authz_check_total[1m])) by (result, cache)",
+          "legendFormat": "Check {{result}} (cache={{cache}})"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["keystone", "iam", "zanzibar", "security"],
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Keystone IAM & ReBAC Overview",
+  "uid": "keystone-overview",
+  "version": 1
+}

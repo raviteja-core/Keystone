@@ -240,6 +240,41 @@ func (m *Manager) GetActiveKey(ctx context.Context) (*SigningKey, error) {
 	return key, nil
 }
 
+// GetPublicKey returns the public key for the given key ID, whether active or retired.
+func (m *Manager) GetPublicKey(ctx context.Context, kid string) (*rsa.PublicKey, error) {
+	m.mu.RLock()
+	if m.cachedKey != nil && m.cachedKey.KID == kid {
+		pub := m.cachedKey.PublicKey
+		m.mu.RUnlock()
+		return pub, nil
+	}
+	m.mu.RUnlock()
+
+	if m.pool == nil {
+		return nil, ErrKeyNotFound
+	}
+
+	var publicJWKBytes []byte
+	err := m.pool.QueryRow(ctx, `
+		SELECT public_jwk
+		FROM signing_keys
+		WHERE kid = $1 AND status != $2
+	`, kid, StatusRevoked).Scan(&publicJWKBytes)
+	if err != nil {
+		return nil, ErrKeyNotFound
+	}
+
+	var jwk jose.JSONWebKey
+	if err := json.Unmarshal(publicJWKBytes, &jwk); err != nil {
+		return nil, err
+	}
+	rsaPub, ok := jwk.Key.(*rsa.PublicKey)
+	if !ok {
+		return nil, errors.New("key is not RSA public key")
+	}
+	return rsaPub, nil
+}
+
 // GetPublicJWKS returns public keys in JSON Web Key Set format (never containing private key components).
 func (m *Manager) GetPublicJWKS(ctx context.Context) ([]byte, error) {
 	m.mu.RLock()

@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Keystone OAuth 2.0 PKCE SPA Demo</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 40px; background: #0f172a; color: #f8fafc; }
+        .card { background: #1e293b; border-radius: 8px; padding: 24px; max-width: 650px; margin: 0 auto; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        h1 { margin-top: 0; font-size: 22px; color: #38bdf8; }
+        button { background: #0284c7; color: white; border: none; padding: 10px 18px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; }
+        button:hover { background: #0369a1; }
+        button.secondary { background: #475569; margin-left: 8px; }
+        pre { background: #090d16; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 13px; color: #a5f3fc; }
+        .row { margin-bottom: 16px; }
+        label { display: block; font-size: 12px; text-transform: uppercase; color: #94a3b8; margin-bottom: 4px; }
+        input { width: 100%; box-sizing: border-box; background: #0f172a; border: 1px solid #334155; color: white; padding: 8px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Keystone OAuth 2.0 SPA (PKCE S256)</h1>
+        <p style="color: #94a3b8; font-size: 14px;">Demonstrates RFC 7636 Authorization Code flow with S256 PKCE against Keystone Auth Server.</p>
+
+        <div class="row">
+            <label>Issuer URL</label>
+            <input id="issuer" value="http://localhost:8080" />
+        </div>
+        <div class="row">
+            <label>Client ID</label>
+            <input id="clientId" value="spa-client-123" />
+        </div>
+
+        <div style="margin-top: 20px;">
+            <button id="loginBtn" onclick="initiateLogin()">1. Login with Keystone PKCE</button>
+            <button id="revokeBtn" class="secondary" onclick="revokeToken()" style="display:none;">Revoke Token</button>
+            <button id="logoutBtn" class="secondary" onclick="logout()" style="display:none;">Clear Session</button>
+        </div>
+
+        <div id="outputSection" style="margin-top: 24px; display: none;">
+            <label>Session & Token Output</label>
+            <pre id="output"></pre>
+        </div>
+    </div>
+
+    <script>
+        function base64UrlEncode(buffer) {
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        }
+
+        async function generateCodeChallenge(verifier) {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(verifier);
+            const digest = await window.crypto.subtle.digest('SHA-256', data);
+            return base64UrlEncode(digest);
+        }
+
+        function generateRandomString(length) {
+            const array = new Uint8Array(length);
+            window.crypto.getRandomValues(array);
+            return base64UrlEncode(array);
+        }
+
+        async function initiateLogin() {
+            const issuer = document.getElementById('issuer').value;
+            const clientId = document.getElementById('clientId').value;
+            const verifier = generateRandomString(64);
+            const state = generateRandomString(16);
+            const challenge = await generateCodeChallenge(verifier);
+
+            sessionStorage.setItem('pkce_verifier', verifier);
+            sessionStorage.setItem('pkce_state', state);
+
+            const redirectUri = window.location.origin + window.location.pathname;
+            const authUrl = `${issuer}/authorize?response_type=code` +
+                `&client_id=${encodeURIComponent(clientId)}` +
+                `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+                `&scope=${encodeURIComponent('openid profile email')}` +
+                `&state=${encodeURIComponent(state)}` +
+                `&code_challenge=${encodeURIComponent(challenge)}` +
+                `&code_challenge_method=S256`;
+
+            window.location.href = authUrl;
+        }
+
+        async function handleCallback() {
+            const params = new URLSearchParams(window.location.search);
+            const code = params.get('code');
+            const state = params.get('state');
+
+            if (!code) return;
+
+            const savedState = sessionStorage.getItem('pkce_state');
+            const verifier = sessionStorage.getItem('pkce_verifier');
+
+            if (state !== savedState) {
+                alert('State mismatch error — potential CSRF');
+                return;
+            }
+
+            const issuer = document.getElementById('issuer').value;
+            const clientId = document.getElementById('clientId').value;
+            const redirectUri = window.location.origin + window.location.pathname;
+
+            const body = new URLSearchParams({
+                grant_type: 'authorization_code',
+                client_id: clientId,
+                code: code,
+                redirect_uri: redirectUri,
+                code_verifier: verifier
+            });
+
+            try {
+                const res = await fetch(`${issuer}/token`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: body.toString()
+                });
+                const tokenData = await res.json();
+                sessionStorage.setItem('access_token', tokenData.access_token);
+                sessionStorage.setItem('refresh_token', tokenData.refresh_token);
+
+                // Clean URL query params
+                window.history.replaceState({}, document.title, window.location.pathname);
+                displayTokens(tokenData);
+            } catch (err) {
+                console.error(err);
+                alert('Token exchange failed: ' + err.message);
+            }
+        }
+
+        function displayTokens(data) {
+            document.getElementById('outputSection').style.display = 'block';
+            document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+            document.getElementById('loginBtn').style.display = 'none';
+            document.getElementById('revokeBtn').style.display = 'inline-block';
+            document.getElementById('logoutBtn').style.display = 'inline-block';
+        }
+
+        async function revokeToken() {
+            const issuer = document.getElementById('issuer').value;
+            const token = sessionStorage.getItem('refresh_token') || sessionStorage.getItem('access_token');
+            const clientId = document.getElementById('clientId').value;
+
+            const body = new URLSearchParams({ token: token });
+            await fetch(`${issuer}/revoke`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString()
+            });
+
+            logout();
+            alert('Token successfully revoked via RFC 7009 /revoke endpoint');
+        }
+
+        function logout() {
+            sessionStorage.clear();
+            document.getElementById('outputSection').style.display = 'none';
+            document.getElementById('loginBtn').style.display = 'inline-block';
+            document.getElementById('revokeBtn').style.display = 'none';
+            document.getElementById('logoutBtn').style.display = 'none';
+        }
+
+        window.onload = handleCallback;
+    </script>
+</body>
+</html>

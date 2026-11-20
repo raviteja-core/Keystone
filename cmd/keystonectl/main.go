@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/raviteja-core/keystone/internal/auth/audit"
+	"github.com/raviteja-core/keystone/internal/auth/keys"
 	"github.com/raviteja-core/keystone/internal/auth/password"
 	"github.com/raviteja-core/keystone/internal/auth/store"
 	"github.com/raviteja-core/keystone/internal/authz/schema"
@@ -78,22 +80,32 @@ func main() {
 		}
 
 	case "keys":
-		keysCmd := flag.NewFlagSet("keys", flag.ExitOnError)
 		if len(os.Args) < 3 {
-			fmt.Println("usage: keystonectl keys <rotate>")
+			fmt.Println("usage: keystonectl keys <rotate> [flags]")
 			os.Exit(1)
 		}
-		_ = keysCmd.Parse(os.Args[3:])
-		fmt.Printf("keystonectl: keys %s ready for Phase 1\n", os.Args[2])
+		subCmd := os.Args[2]
+		switch subCmd {
+		case "rotate":
+			runKeysRotate(os.Args[3:])
+		default:
+			fmt.Fprintf(os.Stderr, "unknown keys command: %s\n", subCmd)
+			os.Exit(1)
+		}
 
 	case "audit":
-		auditCmd := flag.NewFlagSet("audit", flag.ExitOnError)
 		if len(os.Args) < 3 {
-			fmt.Println("usage: keystonectl audit <verify>")
+			fmt.Println("usage: keystonectl audit <verify> [flags]")
 			os.Exit(1)
 		}
-		_ = auditCmd.Parse(os.Args[3:])
-		fmt.Printf("keystonectl: audit %s ready for Phase 4\n", os.Args[2])
+		subCmd := os.Args[2]
+		switch subCmd {
+		case "verify":
+			runAuditVerify(os.Args[3:])
+		default:
+			fmt.Fprintf(os.Stderr, "unknown audit command: %s\n", subCmd)
+			os.Exit(1)
+		}
 
 	case "schema":
 		if len(os.Args) < 3 {
@@ -425,6 +437,71 @@ func runSchemaPush(args []string) {
 
 	zookie := authzstore.EncodeZookie(*tenantID, createdRev)
 	fmt.Printf("Schema version %d successfully pushed for tenant %q (zookie: %s)\n", nextVersion, *tenantID, zookie)
+}
+
+func runKeysRotate(args []string) {
+	rotateCmd := flag.NewFlagSet("rotate", flag.ExitOnError)
+	dbURL := rotateCmd.String("db-url", "", "PostgreSQL database URL")
+	bits := rotateCmd.Int("bits", 2048, "RSA key size in bits (2048 or 3072)")
+	_ = rotateCmd.Parse(args)
+
+	ctx := context.Background()
+	pool, err := getDBPool(ctx, *dbURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to connect to database: %v\n", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	masterKeyB64 := os.Getenv("KEYSTONE_MASTER_KEY")
+	if masterKeyB64 == "" {
+		masterKeyB64 = "ta2vI9UdhLTp7Ak2M33C9oSRrdl6riaCkKFL6UDP6Zc="
+	}
+	masterKey, err := base64.StdEncoding.DecodeString(masterKeyB64)
+	if err != nil {
+		masterKey, err = base64.RawURLEncoding.DecodeString(masterKeyB64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid base64 master key: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	km, err := keys.NewManager(pool, masterKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to initialize key manager: %v\n", err)
+		os.Exit(1)
+	}
+
+	newKey, err := km.RotateKey(ctx, *bits)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: key rotation failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Successfully rotated signing key!\nNew Active Key ID (kid): %s\nAlgorithm: %s\nStatus: %s\nCreated: %s\n",
+		newKey.KID, newKey.Algorithm, newKey.Status, newKey.CreatedAt.Format(time.RFC3339))
+}
+
+func runAuditVerify(args []string) {
+	verifyCmd := flag.NewFlagSet("verify", flag.ExitOnError)
+	dbURL := verifyCmd.String("db-url", "", "PostgreSQL database URL")
+	_ = verifyCmd.Parse(args)
+
+	ctx := context.Background()
+	pool, err := getDBPool(ctx, *dbURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to connect to database: %v\n", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	count, err := audit.VerifyChain(ctx, pool)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "AUDIT CHAIN INTEGRITY FAILURE: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Audit hash chain verification SUCCESS: %d event records verified with zero tampering detected.\n", count)
 }
 
 func printUsage() {

@@ -1,0 +1,27 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: keystone-demo-docs
+
+keystone:
+  issuer-uri: ${KEYSTONE_ISSUER_URL:http://localhost:8080}
+  audience: ${KEYSTONE_AUDIENCE:demo-docs}
+  subject-type: user
+  authz:
+    url: ${KEYSTONE_AUTHZ_URL:http://localhost:8081}
+    client-id: ${KEYSTONE_CLIENT_ID:demo-docs}
+    client-secret: ${KEYSTONE_CLIENT_SECRET:demo-secret}
+    timeout: 500ms
+    fail-mode: closed
+    cache:
+      enabled: true
+      ttl: 5s
+      max-size: 10000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

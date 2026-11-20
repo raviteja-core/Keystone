@@ -18,6 +18,7 @@ import (
 	"github.com/raviteja-core/keystone/internal/auth/keys"
 	"github.com/raviteja-core/keystone/internal/auth/oauth"
 	"github.com/raviteja-core/keystone/internal/auth/password"
+	"github.com/raviteja-core/keystone/internal/auth/scim"
 	"github.com/raviteja-core/keystone/internal/auth/session"
 	"github.com/raviteja-core/keystone/internal/auth/store"
 	"github.com/raviteja-core/keystone/internal/auth/token"
@@ -27,6 +28,8 @@ import (
 	"github.com/raviteja-core/keystone/internal/platform/db"
 	"github.com/raviteja-core/keystone/internal/platform/httpx"
 	"github.com/raviteja-core/keystone/internal/platform/logging"
+	"github.com/raviteja-core/keystone/internal/platform/metrics"
+	"github.com/raviteja-core/keystone/internal/platform/ratelimit"
 	"github.com/raviteja-core/keystone/migrations"
 )
 
@@ -153,16 +156,32 @@ func main() {
 	}, authStore, keyMgr, logger)
 	auditWriter := audit.NewWriter(pool)
 	tokenHandler.SetAuditWriter(auditWriter)
-	publicMux.Handle("POST /token", tokenHandler)
+
+	// Rate limiters
+	tokenLimiter := ratelimit.NewLimiter(time.Minute, 120, 5*time.Minute)
+	loginLimiter := ratelimit.NewLimiter(time.Minute, 20, 15*time.Minute)
+
+	// RFC 7009 Token Revocation & RFC 7662 Token Introspection
+	revokeHandler := oauth.NewRevokeHandler(authStore, tokenHandler, logger)
+	revokeHandler.SetAuditWriter(auditWriter)
+	introspectHandler := oauth.NewIntrospectHandler(cfg.Issuer, authStore, keyMgr, tokenHandler, logger)
+
+	publicMux.Handle("POST /token", tokenLimiter.Middleware(tokenHandler))
+	publicMux.Handle("POST /revoke", revokeHandler)
+	publicMux.Handle("POST /introspect", introspectHandler)
 
 	userinfoHandler := userinfo.NewHandler(tokenValidator, authStore)
 	publicMux.Handle("GET /userinfo", userinfoHandler)
 	publicMux.Handle("POST /userinfo", userinfoHandler)
 
+	// RFC 7643 & RFC 7644 SCIM 2.0 User Provisioning
+	scimHandler := scim.NewHandler(cfg.Issuer, authStore, logger)
+	scimHandler.RegisterRoutes(publicMux)
+
 	// HTML UI endpoints
 	uiHandler := ui.NewHandler(authStore, sessMgr, hasher, auditWriter, logger)
 	publicMux.HandleFunc("GET /login", uiHandler.HandleLogin)
-	publicMux.HandleFunc("POST /login", uiHandler.HandleLogin)
+	publicMux.Handle("POST /login", loginLimiter.Middleware(http.HandlerFunc(uiHandler.HandleLogin)))
 	publicMux.HandleFunc("GET /register", uiHandler.HandleRegister)
 	publicMux.HandleFunc("POST /register", uiHandler.HandleRegister)
 	publicMux.HandleFunc("GET /consent", uiHandler.HandleConsent)
@@ -172,8 +191,10 @@ func main() {
 	publicHandler := httpx.RequestID(
 		httpx.Recover(logger)(
 			httpx.AccessLog(logger)(
-				httpx.SecurityHeaders(
-					httpx.MaxBodyBytes(65536)(publicMux),
+				metrics.Middleware("authserver")(
+					httpx.SecurityHeaders(
+						httpx.MaxBodyBytes(65536)(publicMux),
+					),
 				),
 			),
 		),
@@ -183,6 +204,7 @@ func main() {
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("GET /healthz", handleHealthz)
 	adminMux.HandleFunc("GET /readyz", handleReadyz(pool, keyMgr))
+	adminMux.Handle("GET /metrics", metrics.Handler())
 
 	adminHandler := httpx.RequestID(
 		httpx.Recover(logger)(

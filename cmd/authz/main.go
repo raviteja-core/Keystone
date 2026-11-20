@@ -12,12 +12,14 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/raviteja-core/keystone/internal/authz/api"
+	"github.com/raviteja-core/keystone/internal/authz/cache"
 	"github.com/raviteja-core/keystone/internal/authz/engine"
 	"github.com/raviteja-core/keystone/internal/authz/store"
 	"github.com/raviteja-core/keystone/internal/platform/config"
 	"github.com/raviteja-core/keystone/internal/platform/db"
 	"github.com/raviteja-core/keystone/internal/platform/httpx"
 	"github.com/raviteja-core/keystone/internal/platform/logging"
+	"github.com/raviteja-core/keystone/internal/platform/metrics"
 	"github.com/raviteja-core/keystone/migrations"
 )
 
@@ -69,6 +71,21 @@ func main() {
 	authzStore := store.New(pool)
 	authzEngine := engine.New(authzStore, engine.DefaultConfig())
 
+	// Initialize cache (Redis or in-memory)
+	redisURL := os.Getenv("KEYSTONE_REDIS_URL")
+	if redisURL != "" {
+		rc, err := cache.NewRedisCache(redisURL)
+		if err == nil {
+			authzEngine.SetCache(rc)
+			logger.Info("connected to redis check cache", slog.String("url", redisURL))
+		} else {
+			logger.Warn("failed to initialize redis cache, falling back to memory cache", slog.Any("error", err))
+			authzEngine.SetCache(cache.NewMemoryCache())
+		}
+	} else {
+		authzEngine.SetCache(cache.NewMemoryCache())
+	}
+
 	// Initialize JWKS key provider from Auth Server discovery or config
 	jwksURL := os.Getenv("KEYSTONE_AUTH_JWKS_URL")
 	if jwksURL == "" {
@@ -89,7 +106,9 @@ func main() {
 	publicHandler := httpx.RequestID(
 		httpx.Recover(logger)(
 			httpx.AccessLog(logger)(
-				publicMux,
+				metrics.Middleware("authz")(
+					publicMux,
+				),
 			),
 		),
 	)
@@ -98,6 +117,7 @@ func main() {
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("GET /healthz", handleHealthz)
 	adminMux.HandleFunc("GET /readyz", handleReadyz(pool))
+	adminMux.Handle("GET /metrics", metrics.Handler())
 
 	adminHandler := httpx.RequestID(
 		httpx.Recover(logger)(

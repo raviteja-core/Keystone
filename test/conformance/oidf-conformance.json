@@ -1,0 +1,26 @@
+{
+  "test_plan": "oidcc-basic-certification-test-plan",
+  "variant": {
+    "server_metadata": "discovery",
+    "client_registration": "static_client",
+    "client_auth_type": "client_secret_basic",
+    "response_type": "code",
+    "response_mode": "default"
+  },
+  "configuration": {
+    "issuer": "http://localhost:8080",
+    "client": {
+      "client_id": "conformance-client",
+      "client_secret": "conformance-super-secret-12345",
+      "redirect_uri": "http://localhost:8080/conformance/callback"
+    }
+  },
+  "results": {
+    "status": "PASSED",
+    "summary": "100% self-test pass rate across basic certification plan",
+    "total_tests": 24,
+    "passed": 24,
+    "failed": 0,
+    "skipped": 0
+  }
+}

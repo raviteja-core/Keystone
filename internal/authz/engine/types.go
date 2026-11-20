@@ -34,4 +34,5 @@ type CheckResponse struct {
 	Revision int64
 	Depth    int
 	DBReads  int
+	Cached   bool
 }
